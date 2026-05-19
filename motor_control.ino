@@ -33,28 +33,45 @@
  *   Motor 2:  STEP -> pin 4,  DIR -> pin 5
  *   Motor 3:  STEP -> pin 6,  DIR -> pin 7
  *
- * DM556T Signal Wiring Note:
- *   The DM556T uses differential STEP/DIR inputs (STEP+/STEP- and DIR+/DIR-).
- *   Two common single-ended wiring options:
+ * DM556T Wiring Options (STEP and DIR are differential inputs):
  *
- *     Common-cathode (recommended):
- *       Connect STEP- and DIR- to GND.
- *       Drive STEP+ and DIR+ from the Arduino pins.
- *       Signals are non-inverted — this is what this firmware assumes.
+ *   Common-cathode (recommended for Arduino Mega 5V logic):
+ *     Connect STEP- and DIR- to GND.
+ *     Drive STEP+ and DIR+ directly from the Arduino output pins.
+ *     Signals are non-inverted — this is what this firmware assumes.
  *
- *     Common-anode:
- *       Connect STEP+ and DIR+ to +5V.
- *       Drive STEP- and DIR- from the Arduino pins.
- *       Signals are logically inverted; motors may run backwards or not at all
- *       unless you add invert logic or swap DIR wiring.
+ *   Common-anode:
+ *     Connect STEP+ and DIR+ to +5V.
+ *     Drive STEP- and DIR- from the Arduino output pins.
+ *     Signals are logically inverted; motors may run in reverse or not spin
+ *     at all without additional invert logic or DIR wiring changes.
  *
- *   If motors run in the wrong direction, set the REVERSE_MOTOR_X constant
- *   to true, or physically swap two motor phase wires (A+ ↔ A−).
+ * DM556T Logic Level Note (Arduino Mega drives 5V):
+ *   The DM556T opto-isolated inputs are compatible with 5V logic in
+ *   common-cathode wiring. The driver's internal resistor limits opto-
+ *   coupler current to roughly 10–15 mA at 5V, within the Arduino Mega's
+ *   40 mA per-pin maximum.
+ *
+ *   Optional protection: add a 100–220 Ω series resistor between each
+ *   Arduino output pin and the corresponding STEP+/DIR+ terminal. This
+ *   keeps opto current above the reliable-trigger threshold (~7 mA) while
+ *   providing some protection against wiring faults. Many builders omit
+ *   these resistors without issue; they are low-cost insurance.
+ *
+ *   Minimum STEP pulse width required by the DM556T: 2.5 μs.
+ *   AccelStepper generates pulses well above this threshold on a 16 MHz
+ *   Mega at all speeds this firmware produces.
+ *
+ *   DIR setup time: DIR must be stable ≥5 μs before the STEP rising edge.
+ *   AccelStepper always writes DIR before toggling STEP, satisfying this.
+ *
+ *   If motors run in the wrong direction, set REVERSE_MOTOR_X to true or
+ *   physically swap two wires on one motor winding (A+ ↔ A−).
  *
  * Enable Pins (defined for future use, not driven by this firmware):
  *   Motor 1 ENA -> pin 8    Motor 2 ENA -> pin 9    Motor 3 ENA -> pin 10
- *   Leave the ENA terminals disconnected unless you need software enable/disable
- *   control. Enable polarity varies between driver revisions — consult your exact
+ *   Leave ENA terminals disconnected unless you need software enable/disable.
+ *   Enable polarity varies between driver revisions — consult your exact
  *   DM556T manual before wiring ENA to avoid accidentally disabling the driver.
  *
  * Power:
@@ -83,38 +100,43 @@
 
 // Microstepping divisor — MUST match the DM556T DIP switch setting (SW5–SW8).
 // Common values: 1 (full step), 2, 4, 8, 16, 32.
-// See the DM556T manual or the calibration notes at the bottom of this file.
+// See the calibration notes at the bottom of this file.
 #define MICROSTEPS  8
 
-// Master speed range in RPM (min should normally stay 0)
+// Master speed range in RPM (MIN should normally stay 0).
 #define MIN_MASTER_RPM    0.0f
 #define MAX_MASTER_RPM   60.0f  // conservative for initial testing; increase once everything runs correctly
 
-// Ratio knob range — each motor RPM = masterRPM × ratio
+// Ratio knob range — each motor's RPM = masterRPM × ratio.
 #define MIN_RATIO  0.0f
 #define MAX_RATIO  2.0f  // conservative for initial testing; increase once everything runs correctly
 
 // Master dead zone: raw ADC counts (0–1023) at or below this value are
-// treated as zero speed. Prevents unintended creep when the knob is
-// at its minimum position. Adjust if your pot doesn't quite reach 0.
+// treated as zero speed. Prevents unintended creep when the knob is at
+// its minimum. Adjust if your pot doesn't quite reach 0.
 #define MASTER_DEAD_ZONE_ADC  30
 
-// Ratio dead zone: ratio values below this are clamped to 0, fully stopping
-// the motor. Lets you park individual motors by turning their knob to minimum.
+// Ratio dead zone: ratio values below this are clamped to 0, fully
+// stopping that motor. Lets you park individual motors at knob minimum.
 #define RATIO_DEAD_ZONE  0.02f
 
-// LCD update strategy: one row is refreshed every LCD_LINE_INTERVAL_MS ms.
-// All four rows cycle at this rate → full display refresh every 4× this value.
-// Default 62 ms per row → full refresh ≈ 4 Hz.
-// Spreading updates across time keeps each I2C write brief and avoids
-// long gaps in motor stepping.
-#define LCD_LINE_INTERVAL_MS  62UL
+// Potentiometer read interval in milliseconds (~100 Hz).
+// Each analogRead() takes ~112 μs; four reads take ~450 μs total.
+// Scheduling reads on this timer keeps the main loop fast between reads
+// so motor stepping is minimally interrupted.
+#define POT_READ_INTERVAL_MS   10UL
+
+// LCD update interval in milliseconds (one row per interval).
+// Four rows × 62 ms = ~250 ms for a full display refresh (~4 Hz).
+// Writing one I2C row takes ~6 ms at 400 kHz; refreshing one row per
+// interval caps the stepping gap to that duration.
+#define LCD_LINE_INTERVAL_MS   62UL
 
 // Analog smoothing strength (exponential moving average alpha).
 // Range: 0.0 (no response) to 1.0 (no smoothing).
 // 0.08 gives gentle filtering suitable for hand-turned potentiometers.
 // Increase toward 0.3 for faster response; decrease toward 0.03 for
-// heavier filtering if your readings are very noisy.
+// heavier filtering if readings are noisy.
 #define SMOOTH_ALPHA  0.08f
 
 // Motor direction reversal. Set to true to invert a motor's direction.
@@ -124,7 +146,7 @@ const bool REVERSE_MOTOR_2 = false;
 const bool REVERSE_MOTOR_3 = false;
 
 // Set to 1 to enable Serial debug output at 115200 baud. Set to 0 to disable.
-// Prints master RPM and each motor's RPM and ratio once per display refresh cycle.
+// When enabled, prints master RPM and each motor's RPM and ratio at ~4 Hz.
 #define DEBUG  0
 
 // ============================================================
@@ -207,6 +229,7 @@ static float masterRPM = 0.0f;
 static float ratio1 = 0.0f, ratio2 = 0.0f, ratio3 = 0.0f;
 static float rpm1   = 0.0f, rpm2   = 0.0f, rpm3   = 0.0f;
 
+static unsigned long lastPotRead   = 0;
 static unsigned long lastLcdUpdate = 0;
 static uint8_t       lcdLine       = 0;  // next row to refresh (cycles 0–3)
 
@@ -230,18 +253,18 @@ static float rpmToStepsPerSec(float rpm) {
 
 // ── LCD formatting ─────────────────────────────────────────────────────────
 //
-// Each row is exactly 20 characters. We use dtostrf() for float-to-string
-// conversion (safe on AVR) and then snprintf() to assemble the fixed-width
-// line. dtostrf(value, totalWidth, decimals, buf) right-pads with spaces if
-// the number is shorter than totalWidth.
+// Each row is exactly 20 characters. dtostrf() handles float-to-string
+// conversion safely on AVR (unlike %f in snprintf, which is unreliable).
+// It pads with leading spaces to totalWidth, keeping the layout stable as
+// values change.
 //
 // Motor row layout (20 chars):
-//   "M1:  300.0 RPM  3.00"
+//   "M1:  xxx.x RPM  x.xx"
 //    ^^^  ^^^^^  ^^^  ^^^^
 //    3+2  5      6    4    = 20
 //
 // Master row layout (20 chars):
-//   "Master:  300.0 RPM  "
+//   "Master:  xxx.x RPM  "
 //    ^^^^^^^  ^^^^^  ^^^^
 //    9        5      6    = 20
 
@@ -251,7 +274,7 @@ static void lcdWriteMotorRow(uint8_t row, uint8_t motorNum,
     char ratioBuf[6];
     char line[21];
     dtostrf(rpm,   5, 1, rpmBuf);   // e.g. "300.0" or "  0.0"
-    dtostrf(ratio, 4, 2, ratioBuf); // e.g. "3.00"  or "0.00"
+    dtostrf(ratio, 4, 2, ratioBuf); // e.g. "2.00"  or "0.00"
     snprintf(line, sizeof(line), "M%d:  %s RPM  %s", motorNum, rpmBuf, ratioBuf);
     lcd.setCursor(0, row);
     lcd.print(line);
@@ -267,6 +290,89 @@ static void lcdWriteMasterRow(float rpm) {
 }
 
 // ============================================================
+// SCHEDULED TASKS
+// ============================================================
+
+// Called every POT_READ_INTERVAL_MS.
+// Reads all four potentiometers, applies smoothing and dead zones, computes
+// commanded RPM per motor, and calls setSpeed() on each AccelStepper.
+// Keeping speed updates here (rather than every loop iteration) makes the
+// hot path — the three runSpeed() calls — as short as possible.
+static void readAndUpdateSpeeds() {
+    float rawMaster = smoothMaster.update(analogRead(POT_MASTER));
+    float rawR1     = smoothRatio1.update(analogRead(POT_RATIO_1));
+    float rawR2     = smoothRatio2.update(analogRead(POT_RATIO_2));
+    float rawR3     = smoothRatio3.update(analogRead(POT_RATIO_3));
+
+    // Master RPM with dead zone
+    if (rawMaster < static_cast<float>(MASTER_DEAD_ZONE_ADC)) {
+        masterRPM = 0.0f;
+    } else {
+        masterRPM = mapf(rawMaster,
+                         static_cast<float>(MASTER_DEAD_ZONE_ADC), 1023.0f,
+                         MIN_MASTER_RPM, MAX_MASTER_RPM);
+        masterRPM = clampf(masterRPM, MIN_MASTER_RPM, MAX_MASTER_RPM);
+    }
+
+    // Ratio multipliers with dead zone.
+    // Formula: motorRPM = masterRPM × ratio
+    // Example: master=60, ratios=1.0/0.5/2.0 → M1=60, M2=30, M3=120 RPM.
+    // Turning master down preserves relative ratios across all three motors.
+    ratio1 = clampf(mapf(rawR1, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
+    ratio2 = clampf(mapf(rawR2, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
+    ratio3 = clampf(mapf(rawR3, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
+
+    if (ratio1 < RATIO_DEAD_ZONE) ratio1 = 0.0f;
+    if (ratio2 < RATIO_DEAD_ZONE) ratio2 = 0.0f;
+    if (ratio3 < RATIO_DEAD_ZONE) ratio3 = 0.0f;
+
+    rpm1 = masterRPM * ratio1;
+    rpm2 = masterRPM * ratio2;
+    rpm3 = masterRPM * ratio3;
+
+    // Convert to steps/sec and apply per-motor direction reversal.
+    float speed1 = rpmToStepsPerSec(rpm1) * (REVERSE_MOTOR_1 ? -1.0f : 1.0f);
+    float speed2 = rpmToStepsPerSec(rpm2) * (REVERSE_MOTOR_2 ? -1.0f : 1.0f);
+    float speed3 = rpmToStepsPerSec(rpm3) * (REVERSE_MOTOR_3 ? -1.0f : 1.0f);
+
+    motor1.setSpeed(speed1);
+    motor2.setSpeed(speed2);
+    motor3.setSpeed(speed3);
+
+#if DEBUG
+    // Rate-limit serial output to ~4 Hz (every 25 calls × 10 ms = 250 ms).
+    static uint8_t debugTick = 0;
+    if (++debugTick >= 25) {
+        debugTick = 0;
+        Serial.print(F("Master="));
+        Serial.print(masterRPM, 1);
+        Serial.print(F(" RPM  |  M1="));
+        Serial.print(rpm1, 1);
+        Serial.print(F(" (x")); Serial.print(ratio1, 2); Serial.print(F(")"));
+        Serial.print(F("  M2="));
+        Serial.print(rpm2, 1);
+        Serial.print(F(" (x")); Serial.print(ratio2, 2); Serial.print(F(")"));
+        Serial.print(F("  M3="));
+        Serial.print(rpm3, 1);
+        Serial.print(F(" (x")); Serial.print(ratio3, 2); Serial.println(F(")"));
+    }
+#endif
+}
+
+// Called every LCD_LINE_INTERVAL_MS.
+// Writes one row and advances lcdLine, cycling through all four rows.
+// Four calls × 62 ms = ~250 ms for a full display refresh.
+static void updateLcdRow() {
+    switch (lcdLine) {
+        case 0: lcdWriteMotorRow(0, 1, rpm1, ratio1); break;
+        case 1: lcdWriteMotorRow(1, 2, rpm2, ratio2); break;
+        case 2: lcdWriteMotorRow(2, 3, rpm3, ratio3); break;
+        case 3: lcdWriteMasterRow(masterRPM);          break;
+    }
+    lcdLine = (lcdLine + 1) & 3;  // 0 → 1 → 2 → 3 → 0
+}
+
+// ============================================================
 // SETUP
 // ============================================================
 
@@ -277,7 +383,7 @@ void setup() {
 #endif
 
     // 400 kHz fast-mode I2C reduces each LCD row write from ~25 ms to ~6 ms,
-    // which shortens the gap in motor stepping during display updates.
+    // shortening the stepping gap during each display update.
     Wire.begin();
     Wire.setClock(400000UL);
 
@@ -290,8 +396,8 @@ void setup() {
     lcd.print(F("   Initializing...  "));
 
     // setMaxSpeed() must be called before setSpeed().
-    // Calculate the theoretical maximum steps/sec across all possible settings,
-    // with 10 % headroom so AccelStepper never clips the requested speed.
+    // Calculate the theoretical maximum steps/sec with 10 % headroom so
+    // AccelStepper never silently clips a requested speed.
     const float maxSpd = rpmToStepsPerSec(MAX_MASTER_RPM * MAX_RATIO) * 1.1f;
     motor1.setMaxSpeed(maxSpd);
     motor2.setMaxSpeed(maxSpd);
@@ -307,91 +413,44 @@ void setup() {
 
 // ============================================================
 // LOOP
+//
+// Priority order, top to bottom:
+//   1. runSpeed() × 3  — every iteration, no conditions
+//   2. readAndUpdateSpeeds() — every 10 ms (~100 Hz)
+//   3. updateLcdRow()  — every 62 ms (~4 Hz full refresh)
+//
+// runSpeed() is non-blocking: it checks micros() internally and pulses
+// STEP only when a step is due, returning in a few microseconds either
+// way. Calling it unconditionally at the top of every iteration gives
+// the tightest achievable step timing in a cooperative loop.
+//
+// The millis() checks below are two integer subtractions and comparisons —
+// effectively free. Heavy work (ADC reads, I2C writes) only runs when its
+// timer fires, so the hot path stays as short as possible.
 // ============================================================
 
 void loop() {
-    // ── 1. Read and smooth all potentiometers ─────────────────
-    float rawMaster = smoothMaster.update(analogRead(POT_MASTER));
-    float rawR1     = smoothRatio1.update(analogRead(POT_RATIO_1));
-    float rawR2     = smoothRatio2.update(analogRead(POT_RATIO_2));
-    float rawR3     = smoothRatio3.update(analogRead(POT_RATIO_3));
-
-    // ── 2. Master RPM with dead zone ──────────────────────────
-    // Below MASTER_DEAD_ZONE_ADC the master is treated as fully off,
-    // guaranteeing a clean stop even if the pot doesn't quite hit 0.
-    if (rawMaster < static_cast<float>(MASTER_DEAD_ZONE_ADC)) {
-        masterRPM = 0.0f;
-    } else {
-        masterRPM = mapf(rawMaster,
-                         static_cast<float>(MASTER_DEAD_ZONE_ADC), 1023.0f,
-                         MIN_MASTER_RPM, MAX_MASTER_RPM);
-        masterRPM = clampf(masterRPM, MIN_MASTER_RPM, MAX_MASTER_RPM);
-    }
-
-    // ── 3. Ratio multipliers with dead zone ───────────────────
-    ratio1 = clampf(mapf(rawR1, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
-    ratio2 = clampf(mapf(rawR2, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
-    ratio3 = clampf(mapf(rawR3, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
-
-    if (ratio1 < RATIO_DEAD_ZONE) ratio1 = 0.0f;
-    if (ratio2 < RATIO_DEAD_ZONE) ratio2 = 0.0f;
-    if (ratio3 < RATIO_DEAD_ZONE) ratio3 = 0.0f;
-
-    // ── 4. Commanded RPM: motorRPM = masterRPM × ratio ────────
-    //
-    // Example:  master = 100 RPM, ratios = 1.0 / 0.5 / 2.0
-    //   → M1 = 100 RPM,  M2 = 50 RPM,  M3 = 200 RPM
-    // Turn master down to 50 RPM — relative ratios are preserved:
-    //   → M1 = 50 RPM,   M2 = 25 RPM,  M3 = 100 RPM
-    rpm1 = masterRPM * ratio1;
-    rpm2 = masterRPM * ratio2;
-    rpm3 = masterRPM * ratio3;
-
-    // ── 5. Update motor speeds ────────────────────────────────
-    // Positive speed → forward, negative speed → reverse.
-    // REVERSE_MOTOR_X flips the sign for motors that are mechanically inverted.
-    float speed1 = rpmToStepsPerSec(rpm1) * (REVERSE_MOTOR_1 ? -1.0f : 1.0f);
-    float speed2 = rpmToStepsPerSec(rpm2) * (REVERSE_MOTOR_2 ? -1.0f : 1.0f);
-    float speed3 = rpmToStepsPerSec(rpm3) * (REVERSE_MOTOR_3 ? -1.0f : 1.0f);
-
-    motor1.setSpeed(speed1);
-    motor2.setSpeed(speed2);
-    motor3.setSpeed(speed3);
-
-    // ── 6. Step motors — non-blocking ────────────────────────
-    // runSpeed() checks micros() internally and pulses the STEP pin only
-    // when a step is due. No delay(), no blocking.
+    // ── TOP PRIORITY ─────────────────────────────────────────
     motor1.runSpeed();
     motor2.runSpeed();
     motor3.runSpeed();
 
-    // ── 7. Refresh one LCD row per interval (~4 Hz full cycle) ─
-    // Writing all four rows at once could block for ~25 ms (even at 400 kHz I2C),
-    // causing missed steps. Spreading updates one row per interval limits each
-    // write to ~6 ms.
     unsigned long now = millis();
+
+    // ── MEDIUM PRIORITY: read pots, recalculate, update speeds ─
+    // ~450 μs of analogRead() work every 10 ms. At 60 RPM × ratio 2
+    // (the default ceiling), the step period is 625 μs, so the brief
+    // read pause is comparable to one step interval and recovers quickly.
+    if (now - lastPotRead >= POT_READ_INTERVAL_MS) {
+        lastPotRead = now;
+        readAndUpdateSpeeds();
+    }
+
+    // ── LOW PRIORITY: refresh one LCD row ────────────────────
+    // ~6 ms of I2C write work every 62 ms. Four rows cycle in ~250 ms.
     if (now - lastLcdUpdate >= LCD_LINE_INTERVAL_MS) {
         lastLcdUpdate = now;
-
-        switch (lcdLine) {
-            case 0: lcdWriteMotorRow(0, 1, rpm1, ratio1); break;
-            case 1: lcdWriteMotorRow(1, 2, rpm2, ratio2); break;
-            case 2: lcdWriteMotorRow(2, 3, rpm3, ratio3); break;
-            case 3: lcdWriteMasterRow(masterRPM);          break;
-        }
-        lcdLine = (lcdLine + 1) & 3;  // cycle 0 → 1 → 2 → 3 → 0
-
-#if DEBUG
-        if (lcdLine == 0) {  // print once per complete display refresh cycle
-            Serial.print(F("Master="));  Serial.print(masterRPM, 1);
-            Serial.print(F(" RPM  |  M1="));
-            Serial.print(rpm1, 1);  Serial.print(F(" (x")); Serial.print(ratio1, 2); Serial.print(F(")"));
-            Serial.print(F("  M2="));
-            Serial.print(rpm2, 1);  Serial.print(F(" (x")); Serial.print(ratio2, 2); Serial.print(F(")"));
-            Serial.print(F("  M3="));
-            Serial.print(rpm3, 1);  Serial.print(F(" (x")); Serial.print(ratio3, 2); Serial.println(F(")"));
-        }
-#endif
+        updateLcdRow();
     }
 }
 
@@ -404,8 +463,7 @@ void loop() {
 //  Row 2: "M3:  xxx.x RPM  x.xx"   (motor 3)
 //  Row 3: "Master:  xxx.x RPM  "   (master speed setting)
 //
-//  Each row is exactly 20 characters. RPM is always 1 decimal place.
-//  Ratio is always 2 decimal places.
+//  Each row is exactly 20 characters. RPM is 1 decimal place; ratio is 2.
 //
 // ============================================================
 // CALIBRATION & FIRST-RUN NOTES
@@ -488,7 +546,7 @@ void loop() {
 //        At 300 RPM / ratio 3: 300 × 3 × 200 × 8 / 60 = 24 000 steps/sec ← also safe.
 //
 //      If your calculation exceeds ~40 000 steps/sec, reduce MICROSTEPS
-//      or reduce MAX_MASTER_RPM / MAX_RATIO accordingly.
+//      or lower MAX_MASTER_RPM / MAX_RATIO accordingly.
 //
 // ── 7. SMOOTHING ADJUSTMENT ─────────────────────────────────
 //    SMOOTH_ALPHA = 0.08 suits most hand-turned pots.
@@ -498,8 +556,8 @@ void loop() {
 // ── 8. HIGH-SPEED STEPPING NOTE ─────────────────────────────
 //    AccelStepper's runSpeed() is software-timed via micros(). At speeds
 //    above ~20 000 steps/sec, or if the main loop has other blocking work,
-//    step timing may become irregular. For very high speeds or
-//    timing-critical applications, consider hardware timer interrupts
-//    (TimerOne library or direct AVR timer registers) to generate step pulses.
+//    step timing may become irregular. For very high speeds or timing-
+//    critical applications, consider hardware timer interrupts (TimerOne
+//    library or direct AVR timer registers) to generate step pulses.
 //
 // ============================================================
