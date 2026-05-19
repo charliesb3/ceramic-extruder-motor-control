@@ -139,11 +139,12 @@
 // heavier filtering if readings are noisy.
 #define SMOOTH_ALPHA  0.08f
 
-// Motor direction reversal. Set to true to invert a motor's direction.
+// Motor direction reversal — index 0 = Motor 1, 1 = Motor 2, 2 = Motor 3.
+// Set an entry to true to invert that motor's direction.
 // Flip if a motor runs backwards relative to your mechanical requirement.
-const bool REVERSE_MOTOR_1 = false;
-const bool REVERSE_MOTOR_2 = false;
-const bool REVERSE_MOTOR_3 = false;
+// constexpr lets the compiler evaluate REVERSE[i] ? -1.0f : 1.0f at
+// compile time when the index is constant, eliminating the dead branch.
+constexpr bool REVERSE[3] = { false, false, false };
 
 // Set to 1 to enable Serial debug output at 115200 baud. Set to 0 to disable.
 // When enabled, prints master RPM and each motor's RPM and ratio at ~4 Hz.
@@ -169,6 +170,9 @@ const bool REVERSE_MOTOR_3 = false;
 #define POT_RATIO_2  A2
 #define POT_RATIO_3  A3
 
+// Pot pin lookup — index 0 = master, 1–3 = motor ratio knobs.
+const uint8_t POT_PINS[4] = { POT_MASTER, POT_RATIO_1, POT_RATIO_2, POT_RATIO_3 };
+
 // ============================================================
 // INCLUDES
 // ============================================================
@@ -182,18 +186,21 @@ const bool REVERSE_MOTOR_3 = false;
 // ============================================================
 
 // Exponential moving average (EMA) filter for potentiometer readings.
-// Initialises to the first sample so there is no startup transient.
+// A bool flag detects the first call and seeds the filter from the raw
+// sample directly, avoiding any startup transient.
 class AnalogSmoother {
 public:
     explicit AnalogSmoother(float alpha = SMOOTH_ALPHA)
-        : _alpha(alpha), _value(-1.0f) {}
+        : _alpha(alpha), _value(0.0f), _seeded(false) {}
 
     // Pass the raw analogRead() result; returns the smoothed float value.
     float update(int raw) {
-        if (_value < 0.0f)
-            _value = static_cast<float>(raw);  // seed on first call
-        else
+        if (!_seeded) {
+            _seeded = true;
+            _value  = static_cast<float>(raw);
+        } else {
             _value += _alpha * (static_cast<float>(raw) - _value);
+        }
         return _value;
     }
 
@@ -202,6 +209,7 @@ public:
 private:
     float _alpha;
     float _value;
+    bool  _seeded;
 };
 
 // ============================================================
@@ -212,22 +220,22 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, 20, 4);
 
 // AccelStepper::DRIVER mode uses a dedicated STEP pin and DIR pin.
 // setSpeed() + runSpeed() gives constant velocity with no acceleration ramp.
-AccelStepper motor1(AccelStepper::DRIVER, STEP_PIN_1, DIR_PIN_1);
-AccelStepper motor2(AccelStepper::DRIVER, STEP_PIN_2, DIR_PIN_2);
-AccelStepper motor3(AccelStepper::DRIVER, STEP_PIN_3, DIR_PIN_3);
+AccelStepper motors[3] = {
+    AccelStepper(AccelStepper::DRIVER, STEP_PIN_1, DIR_PIN_1),
+    AccelStepper(AccelStepper::DRIVER, STEP_PIN_2, DIR_PIN_2),
+    AccelStepper(AccelStepper::DRIVER, STEP_PIN_3, DIR_PIN_3)
+};
 
-AnalogSmoother smoothMaster;
-AnalogSmoother smoothRatio1;
-AnalogSmoother smoothRatio2;
-AnalogSmoother smoothRatio3;
+// Index 0 = master knob, 1–3 = motor ratio knobs.
+AnalogSmoother smoothers[4];
 
 // ============================================================
 // STATE
 // ============================================================
 
 static float masterRPM = 0.0f;
-static float ratio1 = 0.0f, ratio2 = 0.0f, ratio3 = 0.0f;
-static float rpm1   = 0.0f, rpm2   = 0.0f, rpm3   = 0.0f;
+static float ratios[3] = {};
+static float rpms[3]   = {};
 
 static unsigned long lastPotRead   = 0;
 static unsigned long lastLcdUpdate = 0;
@@ -246,9 +254,14 @@ static float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// RPM → steps per second using the compile-time motor constants.
+// Precomputed scale factor: steps per second per RPM.
+// Collapses MOTOR_FULL_STEPS_PER_REV * MICROSTEPS / 60.0 into a single
+// compile-time constant so rpmToStepsPerSec() is one multiply at runtime.
+static constexpr float STEPS_PER_RPM =
+    static_cast<float>(MOTOR_FULL_STEPS_PER_REV) * MICROSTEPS / 60.0f;
+
 static float rpmToStepsPerSec(float rpm) {
-    return rpm * (static_cast<float>(MOTOR_FULL_STEPS_PER_REV) * MICROSTEPS) / 60.0f;
+    return rpm * STEPS_PER_RPM;
 }
 
 // ── LCD formatting ─────────────────────────────────────────────────────────
@@ -299,10 +312,7 @@ static void lcdWriteMasterRow(float rpm) {
 // Keeping speed updates here (rather than every loop iteration) makes the
 // hot path — the three runSpeed() calls — as short as possible.
 static void readAndUpdateSpeeds() {
-    float rawMaster = smoothMaster.update(analogRead(POT_MASTER));
-    float rawR1     = smoothRatio1.update(analogRead(POT_RATIO_1));
-    float rawR2     = smoothRatio2.update(analogRead(POT_RATIO_2));
-    float rawR3     = smoothRatio3.update(analogRead(POT_RATIO_3));
+    float rawMaster = smoothers[0].update(analogRead(POT_PINS[0]));
 
     // Master RPM with dead zone
     if (rawMaster < static_cast<float>(MASTER_DEAD_ZONE_ADC)) {
@@ -314,60 +324,42 @@ static void readAndUpdateSpeeds() {
         masterRPM = clampf(masterRPM, MIN_MASTER_RPM, MAX_MASTER_RPM);
     }
 
-    // Ratio multipliers with dead zone.
     // Formula: motorRPM = masterRPM × ratio
     // Example: master=60, ratios=1.0/0.5/2.0 → M1=60, M2=30, M3=120 RPM.
     // Turning master down preserves relative ratios across all three motors.
-    ratio1 = clampf(mapf(rawR1, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
-    ratio2 = clampf(mapf(rawR2, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
-    ratio3 = clampf(mapf(rawR3, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
-
-    if (ratio1 < RATIO_DEAD_ZONE) ratio1 = 0.0f;
-    if (ratio2 < RATIO_DEAD_ZONE) ratio2 = 0.0f;
-    if (ratio3 < RATIO_DEAD_ZONE) ratio3 = 0.0f;
-
-    rpm1 = masterRPM * ratio1;
-    rpm2 = masterRPM * ratio2;
-    rpm3 = masterRPM * ratio3;
-
-    // Convert to steps/sec and apply per-motor direction reversal.
-    float speed1 = rpmToStepsPerSec(rpm1) * (REVERSE_MOTOR_1 ? -1.0f : 1.0f);
-    float speed2 = rpmToStepsPerSec(rpm2) * (REVERSE_MOTOR_2 ? -1.0f : 1.0f);
-    float speed3 = rpmToStepsPerSec(rpm3) * (REVERSE_MOTOR_3 ? -1.0f : 1.0f);
-
-    motor1.setSpeed(speed1);
-    motor2.setSpeed(speed2);
-    motor3.setSpeed(speed3);
+    for (uint8_t i = 0; i < 3; i++) {
+        float raw  = smoothers[i + 1].update(analogRead(POT_PINS[i + 1]));
+        ratios[i]  = clampf(mapf(raw, 0.0f, 1023.0f, MIN_RATIO, MAX_RATIO), MIN_RATIO, MAX_RATIO);
+        if (ratios[i] < RATIO_DEAD_ZONE) ratios[i] = 0.0f;
+        rpms[i]    = masterRPM * ratios[i];
+        float speed = rpmToStepsPerSec(rpms[i]) * (REVERSE[i] ? -1.0f : 1.0f);
+        motors[i].setSpeed(speed);
+    }
 
 #if DEBUG
     // Rate-limit serial output to ~4 Hz (every 25 calls × 10 ms = 250 ms).
     static uint8_t debugTick = 0;
     if (++debugTick >= 25) {
         debugTick = 0;
-        Serial.print(F("Master="));
-        Serial.print(masterRPM, 1);
-        Serial.print(F(" RPM  |  M1="));
-        Serial.print(rpm1, 1);
-        Serial.print(F(" (x")); Serial.print(ratio1, 2); Serial.print(F(")"));
-        Serial.print(F("  M2="));
-        Serial.print(rpm2, 1);
-        Serial.print(F(" (x")); Serial.print(ratio2, 2); Serial.print(F(")"));
-        Serial.print(F("  M3="));
-        Serial.print(rpm3, 1);
-        Serial.print(F(" (x")); Serial.print(ratio3, 2); Serial.println(F(")"));
+        Serial.print(F("Master=")); Serial.print(masterRPM, 1); Serial.print(F(" RPM"));
+        for (uint8_t i = 0; i < 3; i++) {
+            Serial.print(F("  M")); Serial.print(i + 1); Serial.print('=');
+            Serial.print(rpms[i], 1);
+            Serial.print(F(" (x")); Serial.print(ratios[i], 2); Serial.print(F(")"));
+        }
+        Serial.println();
     }
 #endif
 }
 
 // Called every LCD_LINE_INTERVAL_MS.
-// Writes one row and advances lcdLine, cycling through all four rows.
-// Four calls × 62 ms = ~250 ms for a full display refresh.
+// Rows 0–2 display per-motor data indexed directly from the arrays;
+// row 3 displays the master RPM. Four calls × 62 ms = ~250 ms full refresh.
 static void updateLcdRow() {
-    switch (lcdLine) {
-        case 0: lcdWriteMotorRow(0, 1, rpm1, ratio1); break;
-        case 1: lcdWriteMotorRow(1, 2, rpm2, ratio2); break;
-        case 2: lcdWriteMotorRow(2, 3, rpm3, ratio3); break;
-        case 3: lcdWriteMasterRow(masterRPM);          break;
+    if (lcdLine < 3) {
+        lcdWriteMotorRow(lcdLine, lcdLine + 1, rpms[lcdLine], ratios[lcdLine]);
+    } else {
+        lcdWriteMasterRow(masterRPM);
     }
     lcdLine = (lcdLine + 1) & 3;  // 0 → 1 → 2 → 3 → 0
 }
@@ -399,13 +391,10 @@ void setup() {
     // Calculate the theoretical maximum steps/sec with 10 % headroom so
     // AccelStepper never silently clips a requested speed.
     const float maxSpd = rpmToStepsPerSec(MAX_MASTER_RPM * MAX_RATIO) * 1.1f;
-    motor1.setMaxSpeed(maxSpd);
-    motor2.setMaxSpeed(maxSpd);
-    motor3.setMaxSpeed(maxSpd);
-
-    motor1.setSpeed(0.0f);
-    motor2.setSpeed(0.0f);
-    motor3.setSpeed(0.0f);
+    for (uint8_t i = 0; i < 3; i++) {
+        motors[i].setMaxSpeed(maxSpd);
+        motors[i].setSpeed(0.0f);
+    }
 
     delay(1500);
     lcd.clear();
@@ -431,9 +420,9 @@ void setup() {
 
 void loop() {
     // ── TOP PRIORITY ─────────────────────────────────────────
-    motor1.runSpeed();
-    motor2.runSpeed();
-    motor3.runSpeed();
+    motors[0].runSpeed();
+    motors[1].runSpeed();
+    motors[2].runSpeed();
 
     unsigned long now = millis();
 
