@@ -119,12 +119,23 @@
 // 1.8° motors = 200 (most common), 0.9° motors = 400.
 #define MOTOR_FULL_STEPS_PER_REV 200
 
-// [CHANGED] Per-motor microstepping divisors.
+// Per-motor microstepping divisors.
 // Each constant MUST match that driver's actual microstep wiring or DIP-switch setting.
-// Motor 1 is the HR4988 — MICROSTEPS_M1 must match the MS1/MS2/MS3 pin wiring in hardware.
-// Motors 2 and 3 are DM556T drivers — MICROSTEPS_M2/M3 must match the SW5–SW8 DIP switch setting.
-// Common values: 1 (full step), 2, 4, 8, 16, 32.
-#define MICROSTEPS_M1            8  // HR4988 — must match MS1/MS2/MS3 hardware wiring
+//
+// Motor 1 — HR4988:
+//   MS1/MS2/MS3 currently disconnected → full-step mode (1 microstep).
+//   MICROSTEPS_M1 = 1
+//   To switch to 1/8 microstepping later, wire MS1=HIGH, MS2=HIGH, MS3=LOW
+//   and change MICROSTEPS_M1 to 8 — no other code changes are required.
+//
+// Motor 2 — DM556T:
+//   1/8 microstepping set via SW5–SW8 DIP switches.
+//   MICROSTEPS_M2 = 8
+//
+// Motor 3 — DM556T:
+//   1/8 microstepping set via SW5–SW8 DIP switches.
+//   MICROSTEPS_M3 = 8
+#define MICROSTEPS_M1            1  // HR4988 — MS1/MS2/MS3 disconnected, full-step mode
 #define MICROSTEPS_M2            8  // DM556T — must match SW5–SW8 DIP switch setting
 #define MICROSTEPS_M3            8  // DM556T — must match SW5–SW8 DIP switch setting
 
