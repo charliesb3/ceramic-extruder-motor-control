@@ -4,6 +4,22 @@
  * Target: Arduino Mega 2560
  * ============================================================
  *
+ * Architecture: cooperative state-machine scheduler
+ *   Every loop() call unconditionally invokes runSpeed() for all three
+ *   motors first. All background work (ADC reads, LCD updates) is broken
+ *   into individual sub-operations that each block for at most a few
+ *   hundred microseconds, so step generation is never starved.
+ *
+ *   Pot reads:  one double-read (dummy + real, ~208 µs) per loop iteration,
+ *               cycling Master → M1 → M2 → M3 → repeat. Speeds are
+ *               recalculated immediately when each pot completes its
+ *               MULTI_SAMPLE_COUNT samples.
+ *
+ *   LCD writes: one I2C operation (~450 µs) per loop iteration when a row
+ *               write is in progress. A row is only queued when its
+ *               formatted content has actually changed. Rows are checked
+ *               at most once every LCD_LINE_INTERVAL_MS milliseconds.
+ *
  * Required Libraries (install via Arduino IDE > Sketch > Include Library
  *                      > Manage Libraries):
  *
@@ -32,7 +48,7 @@
  *   Motor 2 base RPM wiper  -> A2   (0–200 RPM, full left to full right)
  *   Motor 3 base RPM wiper  -> A3   (0–200 RPM, full left to full right)
  *
- * [CHANGED] Motor 1 — HR4988 stepper driver:
+ * Motor 1 — HR4988 stepper driver:
  *   Arduino pin 2 -> STEP
  *   Arduino pin 3 -> DIR
  *   Arduino 5V    -> VDD (logic supply)
@@ -46,7 +62,7 @@
  *   Note: EN, RESET, SLEEP, and MS1/MS2/MS3 are handled entirely in
  *   hardware — this firmware does not drive those pins.
  *
- * [CHANGED] Motors 2 and 3 — DM556T stepper drivers:
+ * Motors 2 and 3 — DM556T stepper drivers:
  *   Motor 2:  Arduino pin 4 -> PUL+/STEP+,  Arduino pin 5 -> DIR+
  *   Motor 3:  Arduino pin 6 -> PUL+/STEP+,  Arduino pin 7 -> DIR+
  *   PUL-/STEP- and DIR- -> Arduino/common logic ground
@@ -155,22 +171,18 @@
 // Update this if either constant above changes.
 #define FINAL_MAX_RPM            400.0f
 
-// How often (ms) to read all four potentiometers and recalculate speeds.
-// 16-sample averaging at 112 μs/read takes ~3.6 ms per pot, so the read
-// block itself is ~14 ms regardless of this interval.
-#define POT_READ_INTERVAL_MS     250UL
-
-// How often (ms) to refresh one LCD row.
-// Four rows × this value = full display refresh period.
-// At 100 kHz I2C, writing one row takes roughly 9 ms; spacing rows 100 ms
-// apart caps the stepping gap to ~9 ms per interval.
-// 4 rows × 100 ms = 400 ms per full refresh ≈ 2.5 Hz.
-#define LCD_LINE_INTERVAL_MS     100UL
+// Minimum interval (ms) between checks of each LCD row.
+// A row is only rewritten when its displayed value has actually changed, so
+// this controls how quickly a change appears on the display, not how often
+// the display physically updates.
+// 4 rows × 250 ms = up to 1 s for a full display cycle when all rows change.
+#define LCD_LINE_INTERVAL_MS     250UL
 
 // Number of real ADC samples averaged per pot reading.
-// Each sample is preceded by a discarded dummy read (double-read pattern).
-// Total analogRead() calls per pot per interval: MULTI_SAMPLE_COUNT × 2.
-// 16 samples reduces random noise by a factor of √16 = 4 compared to one read.
+// Each sample pair consists of one dummy read (mux settling) and one real read.
+// 16 samples reduces random noise by a factor of √16 = 4.
+// The MULTI_SAMPLE_COUNT samples for each pot are spread across consecutive
+// loop() calls — each call contributes exactly one sample pair (~208 µs).
 #define MULTI_SAMPLE_COUNT       16
 
 // Low-end dead zone for all potentiometers, as a fraction of each pot's ADC
@@ -192,9 +204,9 @@ constexpr bool REVERSE[3] = { false, false, false };
 // Set to 1 to enable Serial debug output (computed speeds) at 115200 baud.
 #define DEBUG          0
 
-// Set to 1 to print raw and smoothed ADC counts for all four pots on every
-// pot-read cycle (~every 250 ms). Use this to find the calibration endpoints
-// for each pot. See calibration note 4 at the bottom for the procedure.
+// Set to 1 to print raw ADC counts for all four pots once per ~250 ms.
+// Use this to find the calibration endpoints for each pot.
+// See calibration note 4 at the bottom for the procedure.
 // Set back to 0 after calibrating.
 #define DEBUG_RAW_POTS 0
 
@@ -280,13 +292,11 @@ const int POT_ADC_MAX[4] = { MASTER_ADC_MAX, M1_ADC_MAX, M2_ADC_MAX, M3_ADC_MAX 
 #include <LiquidCrystal_I2C.h>
 
 // ============================================================
-// ANALOG SMOOTHER — multi-sample average → hysteresis gate → EMA
-// If motor speed jitter is noticeable at steady knob positions, re-enable EMA
-// smoothing by restoring AnalogSmoother and replacing the deadzoneMapf() calls
-// in readAndUpdateSpeeds() with:
-//   float ema = smoother.update(raw);
-//   output = deadzoneMapf(ema, adcMin, adcMax, outMin, outMax);
-// A starting alpha of 0.2 (at 250 ms interval) gives ~1.25 s settling time.
+// ANALOG SMOOTHER — multi-sample average → dead-zone → physical units
+// If motor speed jitter is noticeable at steady knob positions, EMA smoothing
+// can be layered on top by storing a per-pot running average and passing it
+// through deadzoneMapf() instead of the raw average.
+// A starting alpha of 0.2 gives ~1.25 s settling time at a ~13 ms pot cycle.
 
 // ============================================================
 // OBJECTS
@@ -304,22 +314,36 @@ AccelStepper motors[3] = {
     AccelStepper(AccelStepper::DRIVER, STEP_PIN_3, DIR_PIN_3)
 };
 
-
 // ============================================================
 // STATE
 // ============================================================
 
-static float masterMultiplier = 1.0f;              // clamped 0.0–2.0
-static float baseRpms[3]      = {};                // per-motor base RPM (EMA output, 0–200)
-static float finalRpms[3]     = {};                // quantized final RPM (0–400), drives motors
+static float masterMultiplier = 1.0f;   // clamped 0.0–2.0
+static float baseRpms[3]      = {};     // per-motor base RPM (0–200)
+static float finalRpms[3]     = {};     // quantized final RPM (0–400), drives motors
 
-// Last RPM value actually sent to setSpeed(). Initialised to an impossible
-// value so the first readAndUpdateSpeeds() call always issues setSpeed().
-static float lastSetRpms[3]   = { -1.0f, -1.0f, -1.0f };
+// Last RPM value sent to setSpeed(). Initialised to an impossible value so
+// the first pot completion always issues setSpeed().
+static float lastSetRpms[3] = { -1.0f, -1.0f, -1.0f };
 
-static unsigned long lastPotRead   = 0;
-static unsigned long lastLcdUpdate = 0;
-static uint8_t       lcdLine       = 0;  // next row to refresh (cycles 0–3)
+// ── Pot state machine ─────────────────────────────────────────────────────
+// One sample pair (dummy + real analogRead) is taken per loop() call.
+// potIdx cycles 0→1→2→3→0; potSmpl counts samples within the current pot.
+static uint8_t  potIdx  = 0;   // which pot is being sampled (0–3)
+static uint8_t  potSmpl = 0;   // samples collected so far for this pot (0–15)
+static int32_t  potSum  = 0;   // running sum for current pot
+
+// ── LCD state machine ─────────────────────────────────────────────────────
+// lcdCache[row] holds the 20-character string last written to that display row.
+// Writing is spread one I2C operation per loop() call:
+//   lcdPendCol == 20   → nothing in progress
+//   lcdPendCol == 0xFF → setCursor command needed before first character
+//   lcdPendCol 0–19   → writing character at that column index
+static char     lcdCache[4][21]  = {};    // content currently shown on each row
+static uint8_t  lcdPendRow       = 0;    // display row being written
+static uint8_t  lcdPendCol       = 20;   // write-state sentinel (see above)
+static uint8_t  lcdCheckRow      = 0;    // next row to check for changes (0–3)
+static unsigned long lastLcdCheck = 0;   // millis() when tryStartLcdRow() last ran
 
 // ============================================================
 // HELPERS
@@ -333,7 +357,7 @@ static float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Map an EMA value to [outLo, outHi] with a low-end dead zone.
+// Map a pot value to [outLo, outHi] with a low-end dead zone.
 // Values within POT_DEADZONE_FRACTION of adcMin return outLo (zero).
 // Above the threshold the remaining ADC range is remapped to the full output
 // range, so the knob still sweeps the complete output span outside the zone.
@@ -344,187 +368,156 @@ static float deadzoneMapf(float value, float adcMin, float adcMax,
     return clampf(mapf(value, threshold, adcMax, outLo, outHi), outLo, outHi);
 }
 
-// Take MULTI_SAMPLE_COUNT samples from pin using the double-read pattern:
-// each real reading is preceded by a dummy read that is discarded, allowing
-// the ADC sample-and-hold capacitor to fully settle after the mux switches
-// channels. Returns the integer average, clamped to 0–1023.
-static int readMultiSample(uint8_t pin) {
-    int32_t sum = 0;
-    for (uint8_t s = 0; s < MULTI_SAMPLE_COUNT; s++) {
-        analogRead(pin);         // dummy — lets mux settle, result discarded
-        sum += analogRead(pin);  // real sample
-    }
-    int avg = (int)(sum / (int32_t)MULTI_SAMPLE_COUNT);
-    return avg < 0 ? 0 : (avg > 1023 ? 1023 : avg);
-}
-
-// [CHANGED] Per-motor compile-time scale factors: steps per second per RPM.
-// Index 0 = Motor 1 (HR4988, uses MICROSTEPS_M1).
-// Index 1 = Motor 2 (DM556T, uses MICROSTEPS_M2).
-// Index 2 = Motor 3 (DM556T, uses MICROSTEPS_M3).
+// Per-motor compile-time scale factors: steps per second per RPM.
+// Index 0 = Motor 1 (HR4988, MICROSTEPS_M1).
+// Index 1 = Motor 2 (DM556T, MICROSTEPS_M2).
+// Index 2 = Motor 3 (DM556T, MICROSTEPS_M3).
 static constexpr float STEPS_PER_RPM[3] = {
     (float)MOTOR_FULL_STEPS_PER_REV * MICROSTEPS_M1 / 60.0f,
     (float)MOTOR_FULL_STEPS_PER_REV * MICROSTEPS_M2 / 60.0f,
     (float)MOTOR_FULL_STEPS_PER_REV * MICROSTEPS_M3 / 60.0f
 };
 
-// [CHANGED] Accept motor index so each motor uses its own STEPS_PER_RPM entry.
 static float rpmToStepsPerSec(uint8_t motorIndex, float rpm) {
     return rpm * STEPS_PER_RPM[motorIndex];
 }
 
-// ── LCD row formatting ──────────────────────────────────────────────────────
-//
-// Every row is exactly 20 characters. Integer fields use snprintf %d with
-// explicit width so old digits are always overwritten. dtostrf() is used for
-// the float multiplier because avr-libc snprintf does not support %f.
-//
-// Motor row layout (20 chars):
-//   "M1:  400RPM B:200   "
-//    M   = 1
-//    %d  = 1  (motor number 1–3)
-//    :   = 1
-//    (2 spaces) = 2
-//    %3d = 3  (final RPM 0–400, right-justified)
-//    RPM B: = 6
-//    %3d = 3  (base RPM 0–200, right-justified)
-//    (3 spaces) = 3
-//    total = 1+1+1+2+3+6+3+3 = 20
-//
-// Master row layout (20 chars):
-//   "Master:200% x2.00   "
-//    Master: = 7
-//    %3d     = 3  (master percent 0–200, right-justified)
-//    %%      = 1  (literal %)
-//    (space)x = 2
-//    %s      = 4  (dtostrf width 4, 2 decimals: "0.00"–"2.00")
-//    (3 spaces) = 3
-//    total = 7+3+1+2+4+3 = 20
-
-static void lcdWriteMotorRow(uint8_t row, uint8_t motorNum,
-                             int finalRpm, int baseRpm) {
-    char line[21];
-    snprintf(line, sizeof(line), "M%d:  %3dRPM B:%3d   ",
-             motorNum, finalRpm, baseRpm);
-    lcd.setCursor(0, row);
-    lcd.print(line);
+// ── Per-motor speed recalculation ─────────────────────────────────────────
+// Recomputes finalRpms[m] from baseRpms[m] × masterMultiplier and calls
+// setSpeed() only when the quantized result differs by at least
+// SPEED_UPDATE_THRESHOLD from the last sent value.
+static void recalcMotorSpeed(uint8_t m) {
+    float rawFinal  = clampf(baseRpms[m] * masterMultiplier, 0.0f, FINAL_MAX_RPM);
+    finalRpms[m]    = roundf(rawFinal);
+    if (fabsf(finalRpms[m] - lastSetRpms[m]) < SPEED_UPDATE_THRESHOLD) return;
+    lastSetRpms[m]  = finalRpms[m];
+    float speed     = rpmToStepsPerSec(m, finalRpms[m]) * (REVERSE[m] ? -1.0f : 1.0f);
+    motors[m].setSpeed(speed);
 }
 
-static void lcdWriteMasterRow(float multiplier, int pct) {
-    char multBuf[6];
-    char line[21];
-    dtostrf(multiplier, 4, 2, multBuf);  // e.g. "0.00", "1.00", "2.00"
-    snprintf(line, sizeof(line), "Master:%3d%% x%s   ", pct, multBuf);
-    lcd.setCursor(0, 3);
-    lcd.print(line);
-}
+// ── Pot state machine ──────────────────────────────────────────────────────
+// Called once per loop(). Takes ONE sample pair (dummy + real analogRead) for
+// the current pot and advances the state machine. When MULTI_SAMPLE_COUNT
+// samples have been collected the average is computed, speeds are updated, and
+// the machine advances to the next pot.
+//
+// Pot cycle time: 4 pots × 16 samples × ~208 µs ≈ 13 ms end-to-end, spread
+// across individual loop() calls with runSpeed() executing between each.
+// Worst-case blocking per call: two analogRead() ≈ ~208 µs on a 16 MHz Mega.
+static void doOnePotSample() {
+    uint8_t pin = POT_PINS[potIdx];
+    analogRead(pin);                  // dummy — lets ADC mux settle after channel switch
+    int sample = analogRead(pin);     // real sample
+    potSum += sample;
+    potSmpl++;
+    if (potSmpl < MULTI_SAMPLE_COUNT) return;
 
-// ============================================================
-// SCHEDULED TASKS
-// ============================================================
+    // All samples collected — compute constrained average.
+    int avg = (int)(potSum / (int32_t)MULTI_SAMPLE_COUNT);
+    if (avg < 0)    avg = 0;
+    if (avg > 1023) avg = 1023;
+    int raw = constrain(avg, POT_ADC_MIN[potIdx], POT_ADC_MAX[potIdx]);
 
-// Called every POT_READ_INTERVAL_MS.
-// Full pipeline: multi-sample read → constrain to calibrated range →
-// dead-zone + map to physical units → quantize to whole RPM →
-// update setSpeed() only if value changed.
-static void readAndUpdateSpeeds() {
+    // Map to physical quantity and recalculate affected motor speeds.
+    float fraw = (float)raw;
+    float flo  = (float)POT_ADC_MIN[potIdx];
+    float fhi  = (float)POT_ADC_MAX[potIdx];
 
-    // ── Master multiplier ────────────────────────────────────────────────
-    // Constrain the raw reading to the calibrated endpoint range so that
-    // mapf() always receives inputs within its domain.
-    // ADC_MIN → 0.0× (0%)   midpoint → 1.0× (100%)   ADC_MAX → 2.0× (200%)
-    int rawMaster = readMultiSample(POT_PINS[0]);
-    rawMaster     = constrain(rawMaster, POT_ADC_MIN[0], POT_ADC_MAX[0]);
-    masterMultiplier = deadzoneMapf((float)rawMaster,
-        (float)POT_ADC_MIN[0], (float)POT_ADC_MAX[0],
-        MASTER_MIN_MULTIPLIER, MASTER_MAX_MULTIPLIER);
-
-#if DEBUG_RAW_POTS
-    // Declare storage here so the for-loop blocks below can fill it.
-    int dbgRaw[4];
-    dbgRaw[0] = rawMaster;
-#endif
-
-    // ── Per-motor base RPM and final speed ──────────────────────────────
-    // Formula: finalRPM[i] = baseRPM[i] × masterMultiplier
-    // Examples (bases = 50 / 100 / 200):
-    //   Master  0% → finals =   0 /   0 /   0 RPM
-    //   Master 100% → finals =  50 / 100 / 200 RPM
-    //   Master 200% → finals = 100 / 200 / 400 RPM
-    for (uint8_t i = 0; i < 3; i++) {
-        int rawBase = readMultiSample(POT_PINS[i + 1]);
-        rawBase     = constrain(rawBase, POT_ADC_MIN[i + 1], POT_ADC_MAX[i + 1]);
+    if (potIdx == 0) {
+        // Master multiplier — affects all three motors.
+        masterMultiplier = deadzoneMapf(fraw, flo, fhi,
+                                        MASTER_MIN_MULTIPLIER, MASTER_MAX_MULTIPLIER);
+        recalcMotorSpeed(0);
+        recalcMotorSpeed(1);
+        recalcMotorSpeed(2);
+    } else {
+        // Per-motor base RPM.
+        uint8_t m = potIdx - 1;
+        baseRpms[m] = deadzoneMapf(fraw, flo, fhi, BASE_MIN_RPM, BASE_MAX_RPM);
+        recalcMotorSpeed(m);
+    }
 
 #if DEBUG_RAW_POTS
-        dbgRaw[i + 1] = rawBase;
-#endif
-
-        baseRpms[i] = deadzoneMapf((float)rawBase,
-            (float)POT_ADC_MIN[i + 1], (float)POT_ADC_MAX[i + 1],
-            BASE_MIN_RPM, BASE_MAX_RPM);
-
-        // Clamp product, then quantize to the nearest whole RPM.
-        // Whole-RPM quantization prevents sub-1-RPM noise from reaching setSpeed().
-        float rawFinal = clampf(baseRpms[i] * masterMultiplier, 0.0f, FINAL_MAX_RPM);
-        finalRpms[i]   = roundf(rawFinal);  // nearest whole RPM, stored as float
-
-        // Push a new speed command only when the quantized value moved by
-        // at least SPEED_UPDATE_THRESHOLD RPM from what was last sent.
-        if (fabsf(finalRpms[i] - lastSetRpms[i]) >= SPEED_UPDATE_THRESHOLD) {
-            lastSetRpms[i] = finalRpms[i];
-            // [CHANGED] Pass motor index so the correct per-motor STEPS_PER_RPM is used.
-            float speed    = rpmToStepsPerSec(i, finalRpms[i])
-                             * (REVERSE[i] ? -1.0f : 1.0f);
-            motors[i].setSpeed(speed);
+    // Accumulate raw values; print one line per complete 4-pot cycle, rate-
+    // limited to ~250 ms so the Serial Monitor stays readable.
+    static int           dbgRaw[4] = {};
+    static unsigned long dbgLast   = 0;
+    dbgRaw[potIdx] = raw;
+    if (potIdx == 3) {
+        unsigned long n = millis();
+        if (n - dbgLast >= 250UL) {
+            dbgLast = n;
+            Serial.print(F("[CAL] MST raw="));  Serial.print(dbgRaw[0]);
+            for (uint8_t i = 0; i < 3; i++) {
+                Serial.print(F(" | M")); Serial.print(i + 1);
+                Serial.print(F(" raw="));  Serial.print(dbgRaw[i + 1]);
+            }
+            Serial.println();
         }
     }
-
-#if DEBUG_RAW_POTS
-    // One line per read cycle showing the 16-sample average (constrained to
-    // calibrated range) for every pot.
-    // Use these values to determine _ADC_MIN / _ADC_MAX for each pot:
-    //   turn a knob fully left → record "raw=" → enter as that pot's _ADC_MIN
-    //   turn a knob fully right → record "raw=" → enter as that pot's _ADC_MAX
-    Serial.print(F("[CAL] MST raw="));  Serial.print(dbgRaw[0]);
-    for (uint8_t i = 0; i < 3; i++) {
-        Serial.print(F(" | M")); Serial.print(i + 1);
-        Serial.print(F(" raw="));  Serial.print(dbgRaw[i + 1]);
-    }
-    Serial.println();
 #endif
 
-#if DEBUG
-    // Rate-limit serial output to once per second (4 calls × 250 ms).
-    static uint8_t dbTick = 0;
-    if (++dbTick >= 4) {
-        dbTick = 0;
-        int pct = (int)roundf(clampf(masterMultiplier * 100.0f, 0.0f, 200.0f));
-        Serial.print(F("Master x")); Serial.print(masterMultiplier, 2);
-        Serial.print(F(" (")); Serial.print(pct); Serial.print(F("%)"));
-        for (uint8_t i = 0; i < 3; i++) {
-            Serial.print(F("  M")); Serial.print(i + 1);
-            Serial.print(F(" base=")); Serial.print((int)roundf(baseRpms[i]));
-            Serial.print(F(" final=")); Serial.print((int)finalRpms[i]);
-        }
-        Serial.println();
-    }
-#endif
+    // Advance to the next pot.
+    potSum  = 0;
+    potSmpl = 0;
+    potIdx  = (potIdx + 1) & 3;
 }
 
-// Called every LCD_LINE_INTERVAL_MS.
-// Refreshes one row per call; all four rows cycle in 4 × LCD_LINE_INTERVAL_MS.
-static void updateLcdRow() {
-    if (lcdLine < 3) {
-        // finalRpms[i] is already quantized to a whole RPM; cast is exact.
-        int dispFinal = (int)clampf(finalRpms[lcdLine], 0.0f, FINAL_MAX_RPM);
-        int dispBase  = (int)roundf(clampf(baseRpms[lcdLine], BASE_MIN_RPM, BASE_MAX_RPM));
-        lcdWriteMotorRow(lcdLine, lcdLine + 1, dispFinal, dispBase);
+// ── LCD state machine ──────────────────────────────────────────────────────
+//
+// Row format reference (every row is exactly 20 characters):
+//
+//   Motor rows (rows 0–2):
+//     "M1:  400RPM B:200   "
+//      M%d = 2, ": " = 2, %3d = 3, "RPM B:" = 6, %3d = 3, "   " = 3 → 20
+//
+//   Master row (row 3):
+//     "Master:200% x2.00   "
+//      "Master:" = 7, %3d = 3, "% x" = 3, dtostrf(4,2) = 4, "   " = 3 → 20
+
+// Format current values for display row 'row' into buf (must be ≥21 bytes).
+static void formatLcdRow(uint8_t row, char *buf) {
+    if (row < 3) {
+        int f = (int)clampf(finalRpms[row], 0.0f, FINAL_MAX_RPM);
+        int b = (int)roundf(clampf(baseRpms[row], BASE_MIN_RPM, BASE_MAX_RPM));
+        snprintf(buf, 21, "M%d:  %3dRPM B:%3d   ", row + 1, f, b);
     } else {
         float cMult = clampf(masterMultiplier, MASTER_MIN_MULTIPLIER, MASTER_MAX_MULTIPLIER);
         int   pct   = (int)roundf(clampf(cMult * 100.0f, 0.0f, 200.0f));
-        lcdWriteMasterRow(cMult, pct);
+        char  mBuf[6];
+        dtostrf(cMult, 4, 2, mBuf);   // e.g. "0.00", "1.00", "2.00"
+        snprintf(buf, 21, "Master:%3d%% x%s   ", pct, mBuf);
     }
-    lcdLine = (lcdLine + 1) & 3;  // 0 → 1 → 2 → 3 → 0
+}
+
+// Called once per loop() when a row write is in progress.
+// Issues exactly ONE I2C operation (setCursor or one character write).
+// Worst-case blocking: ~450 µs at 100 kHz I2C.
+static void stepLcd() {
+    if (lcdPendCol == 0xFF) {
+        lcd.setCursor(0, lcdPendRow);
+        lcdPendCol = 0;
+    } else if (lcdPendCol < 20) {
+        lcd.write((uint8_t)lcdCache[lcdPendRow][lcdPendCol]);
+        lcdPendCol++;
+    }
+}
+
+// Called every LCD_LINE_INTERVAL_MS when no row write is in progress.
+// Checks the next display row. If its formatted string differs from the cached
+// (last-written) content a write is queued; otherwise the row is skipped.
+// Cycles through rows 0–3.
+static void tryStartLcdRow() {
+    uint8_t row = lcdCheckRow;
+    lcdCheckRow = (lcdCheckRow + 1) & 3;
+
+    char newLine[21];
+    formatLcdRow(row, newLine);
+    if (memcmp(newLine, lcdCache[row], 20) == 0) return;  // no change — skip
+
+    memcpy(lcdCache[row], newLine, 21);  // update cache to new content
+    lcdPendRow = row;
+    lcdPendCol = 0xFF;                   // signal: send setCursor first
 }
 
 // ============================================================
@@ -550,8 +543,8 @@ void setup() {
     lcd.setCursor(0, 1);
     lcd.print(F("   Initializing...  "));
 
-    // [CHANGED] Calculate maximum step rate independently for each motor so
-    // that different MICROSTEPS values per driver are handled correctly.
+    // Calculate maximum step rate independently for each motor so that
+    // different MICROSTEPS values per driver are handled correctly.
     // 10% headroom ensures AccelStepper never silently clips a requested speed.
     for (uint8_t i = 0; i < 3; i++) {
         float maxSpd = FINAL_MAX_RPM * STEPS_PER_RPM[i] * 1.1f;
@@ -564,20 +557,25 @@ void setup() {
 }
 
 // ============================================================
-// LOOP — three-tier cooperative scheduling
+// LOOP — cooperative state-machine scheduler
 //
-// Priority 1 — every iteration, no conditions:
-//   runSpeed() × 3  (non-blocking; returns in a few microseconds)
+// Every iteration, unconditionally:
+//   runSpeed() × 3        (~4 µs total — always first, never skipped)
 //
-// Priority 2 — every 250 ms:
-//   readAndUpdateSpeeds()  (~14 ms of analogRead work)
+// Every iteration, one pot sample:
+//   doOnePotSample()      (~208 µs — one dummy + one real analogRead)
+//   Speeds recalculate automatically when each pot's 16 samples complete.
 //
-// Priority 3 — every 100 ms:
-//   updateLcdRow()  (~9 ms of I2C write work for one row)
+// Every iteration, one LCD operation (when a row write is in progress):
+//   stepLcd()             (~450 µs — one I2C setCursor or character write)
 //
-// runSpeed() is at the unconditional top so it gets called as often as
-// possible. The millis() comparisons that gate priorities 2 and 3 are two
-// integer subtractions — effectively free in the hot path.
+// Every LCD_LINE_INTERVAL_MS (when no row write is in progress):
+//   tryStartLcdRow()      (pure computation, ~0 µs if no change; queues a
+//                          write if the next row's content has changed)
+//
+// Maximum gap between consecutive runSpeed() calls:
+//   Normal (pot sample only):  ~212 µs
+//   During LCD row write:      ~454 µs  (one pot sample + one I2C op)
 // ============================================================
 
 void loop() {
@@ -642,21 +640,22 @@ void loop() {
     return;
 #endif
 
-    // ── TOP PRIORITY: step all motors ────────────────────────
+    // ── TOP PRIORITY: step all motors (unconditional) ────────
     motors[0].runSpeed();
     motors[1].runSpeed();
     motors[2].runSpeed();
 
-    // ── MEDIUM PRIORITY: read pots and recalculate ───────────
-    if (now - lastPotRead >= POT_READ_INTERVAL_MS) {
-        lastPotRead = now;
-        readAndUpdateSpeeds();
-    }
+    // ── ONE pot sample per iteration ─────────────────────────
+    doOnePotSample();
 
-    // ── LOW PRIORITY: refresh one LCD row ────────────────────
-    if (now - lastLcdUpdate >= LCD_LINE_INTERVAL_MS) {
-        lastLcdUpdate = now;
-        updateLcdRow();
+    // ── ONE LCD I2C operation per iteration (if in progress) ─
+    stepLcd();
+
+    // ── Start a new LCD row check every LCD_LINE_INTERVAL_MS ─
+    // Only runs when no row write is in progress (lcdPendCol == 20).
+    if (lcdPendCol == 20 && now - lastLcdCheck >= LCD_LINE_INTERVAL_MS) {
+        lastLcdCheck = now;
+        tryStartLcdRow();
     }
 }
 
@@ -701,10 +700,10 @@ void loop() {
 //    Motor 1 (HR4988): MICROSTEPS_M1 must match the MS1/MS2/MS3 pin
 //    wiring set in hardware. The HR4988 truth table:
 //      MS1 MS2 MS3 → microsteps
-//       L   L   L  → full step  (1)
+//       L   L   L  → full step  (1)   ← current setting (pins disconnected)
 //       H   L   L  → half step  (2)
 //       L   H   L  → quarter    (4)
-//       H   H   L  → eighth     (8)   ← firmware default
+//       H   H   L  → eighth     (8)
 //       H   H   H  → sixteenth  (16)
 //
 //    Motors 2 and 3 (DM556T): MICROSTEPS_M2/M3 must match the SW5–SW8
@@ -718,7 +717,7 @@ void loop() {
 //      OFF OFF OFF OFF → 1  (full step)
 //      ON  OFF OFF OFF → 2
 //      OFF ON  OFF OFF → 4
-//      ON  ON  OFF OFF → 8   ← matches firmware default
+//      ON  ON  OFF OFF → 8   ← matches MICROSTEPS_M2 / M3 default
 //      OFF OFF ON  OFF → 16
 //      ON  OFF ON  OFF → 32
 //
@@ -738,8 +737,8 @@ void loop() {
 //    Do this once after wiring, before the first motor test.
 //    a) Set DEBUG_RAW_POTS to 1 and re-upload. Open Serial Monitor at 115200.
 //    b) Turn the MASTER knob fully left (minimum). The Serial Monitor prints
-//       a line every 250 ms:
-//         [CAL] MST raw=NNN ema=NNN.N | M1 raw=NNN ...
+//       a line roughly every 250 ms:
+//         [CAL] MST raw=NNN | M1 raw=NNN | M2 raw=NNN | M3 raw=NNN
 //       Note the "MST raw=" value and enter it as MASTER_ADC_MIN.
 //    c) Turn MASTER fully right. Note "MST raw=" → enter as MASTER_ADC_MAX.
 //    d) Repeat for each motor knob: full-left reading → M1_ADC_MIN (etc.),
@@ -754,7 +753,6 @@ void loop() {
 //    b) With all motor knobs and master knob at full left, confirm all
 //       rows show 0 RPM and "Master:  0% x0.00".
 //    c) Turn master to centre — confirm it shows "Master:100% x1.00".
-//       Note: response is intentionally slow (~1 s); this is normal.
 //    d) Raise a motor knob with master at centre and confirm its base
 //       RPM and final RPM change together (1:1 at 100%).
 //    e) With motor knobs set, sweep master left-to-right and confirm
@@ -792,28 +790,37 @@ void loop() {
 //      practical limit on a 16 MHz Mega (~50 000 steps/sec):
 //
 //        max steps/sec = FINAL_MAX_RPM × MOTOR_FULL_STEPS_PER_REV × MICROSTEPS_Mn / 60
-//        Default: 400 × 200 × 8 / 60 = 10 667 steps/sec  ← well within limit.
+//        Default M1: 400 × 200 × 1 / 60 =  1 333 steps/sec  ← full-step HR4988
+//        Default M2/M3: 400 × 200 × 8 / 60 = 10 667 steps/sec  ← 1/8 DM556T
 //
 //      If your calculation exceeds ~40 000 steps/sec, reduce the relevant
 //      MICROSTEPS_Mn constant or lower FINAL_MAX_RPM accordingly.
 //
 // ── 8. TUNING STABILITY vs. RESPONSE ────────────────────────
-//    The firmware has three knobs for trading responsiveness against stability.
-//    Adjust them in this order if the display is still noisy or too sluggish:
+//    In the cooperative scheduler, pots are sampled continuously and speeds
+//    update within ~13 ms of a knob movement (4 pots × 16 samples × ~208 µs).
+//    Increasing MULTI_SAMPLE_COUNT slows response but improves noise rejection:
 //
-//    a) POT_READ_INTERVAL_MS (default 250):
-//       Raise to 500 for very slow, very stable hand control.
-//       Lower to 100 for snappier (but noisier) response.
+//      MULTI_SAMPLE_COUNT 8:   cycle ~6.5 ms,  noise rejection √8  ≈ 2.8×
+//      MULTI_SAMPLE_COUNT 16:  cycle ~13 ms,   noise rejection √16 = 4.0×  ← default
+//      MULTI_SAMPLE_COUNT 32:  cycle ~26 ms,   noise rejection √32 ≈ 5.7×
 //
-//    d) MULTI_SAMPLE_COUNT (default 16):
-//       Raise to 32 for maximum noise rejection (doubles read time to ~7 ms/pot).
-//       Lower to 8 if read time must be shorter.
+//    LCD_LINE_INTERVAL_MS controls how quickly a changed value appears on the
+//    display. With 4 rows and 250 ms per check, the worst-case display lag
+//    for a single changing row is 250 ms; all four rows changing simultaneously
+//    take up to 1 s to fully refresh. Reduce this constant if you need faster
+//    display response (at the cost of slightly more LCD overhead in the loop).
 //
-// ── 9. HIGH-SPEED STEPPING NOTE ─────────────────────────────
-//    AccelStepper's runSpeed() is software-timed via micros(). At speeds
-//    above ~20 000 steps/sec, or if the main loop has other blocking work,
-//    step timing may become irregular. For very high speeds or timing-
-//    critical applications, consider hardware timer interrupts (TimerOne
-//    library or direct AVR timer registers) to generate step pulses.
+// ── 9. STEPPING SMOOTHNESS NOTE ─────────────────────────────
+//    AccelStepper's runSpeed() is software-timed via micros(). The cooperative
+//    scheduler limits the worst-case gap between consecutive runSpeed() calls to
+//    approximately:
+//      ~212 µs during pot sampling alone (no LCD write in progress)
+//      ~454 µs during an active LCD row write (pot sample + one I2C op)
+//    At Motor 1's maximum (400 RPM full-step = 1 333 steps/sec, one step every
+//    750 µs), even the worst-case 454 µs gap is well within one step period.
+//    For very high microstepped speeds (e.g. 10 667 steps/sec at 93 µs/step),
+//    hardware timer interrupts (TimerOne library or direct AVR timer registers)
+//    would eliminate jitter entirely.
 //
 // ============================================================
