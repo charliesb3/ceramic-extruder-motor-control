@@ -32,12 +32,28 @@
  *   Motor 2 base RPM wiper  -> A2   (0–200 RPM, full left to full right)
  *   Motor 3 base RPM wiper  -> A3   (0–200 RPM, full left to full right)
  *
- * DM556T Stepper Drivers:
- *   Motor 1:  STEP -> pin 2,  DIR -> pin 3
- *   Motor 2:  STEP -> pin 4,  DIR -> pin 5
- *   Motor 3:  STEP -> pin 6,  DIR -> pin 7
+ * [CHANGED] Motor 1 — HR4988 stepper driver:
+ *   Arduino pin 2 -> STEP
+ *   Arduino pin 3 -> DIR
+ *   Arduino 5V    -> VDD (logic supply)
+ *   Arduino/common ground -> logic GND
+ *   Motor PSU positive -> VMOT
+ *   Motor PSU negative -> motor-power GND
+ *   RESET and SLEEP tied HIGH in hardware
+ *   EN tied LOW or otherwise permanently enabled in hardware
+ *   MS1/MS2/MS3 set in hardware to match MICROSTEPS_M1
+ *   Motor coils connected to 1A/1B and 2A/2B
+ *   Note: EN, RESET, SLEEP, and MS1/MS2/MS3 are handled entirely in
+ *   hardware — this firmware does not drive those pins.
  *
- * DM556T Wiring Options (STEP and DIR are differential inputs):
+ * [CHANGED] Motors 2 and 3 — DM556T stepper drivers:
+ *   Motor 2:  Arduino pin 4 -> PUL+/STEP+,  Arduino pin 5 -> DIR+
+ *   Motor 3:  Arduino pin 6 -> PUL+/STEP+,  Arduino pin 7 -> DIR+
+ *   PUL-/STEP- and DIR- -> Arduino/common logic ground
+ *   ENA disconnected
+ *
+ * DM556T Wiring Options for Motors 2 and 3 (STEP and DIR are differential
+ * inputs):
  *
  *   Common-cathode (recommended for Arduino Mega 5V logic):
  *     Connect STEP- and DIR- to GND.
@@ -50,7 +66,7 @@
  *     Signals are logically inverted; motors may run in reverse or not spin
  *     at all without additional invert logic or DIR wiring changes.
  *
- * DM556T Logic Level Note (Arduino Mega drives 5V):
+ * DM556T Logic Level Note for Motors 2 and 3 (Arduino Mega drives 5V):
  *   The DM556T opto-isolated inputs are compatible with 5V logic in
  *   common-cathode wiring. The driver's internal resistor limits opto-
  *   coupler current to roughly 10–15 mA at 5V, within the Arduino Mega's
@@ -73,14 +89,15 @@
  *   true or physically swap two wires on one motor winding (A+ ↔ A−).
  *
  * Enable Pins (defined for future use, not driven by this firmware):
- *   Motor 1 ENA -> pin 8    Motor 2 ENA -> pin 9    Motor 3 ENA -> pin 10
+ *   Motor 1 EN is tied LOW (or permanently enabled) in hardware — no pin needed.
+ *   Motor 2 ENA -> pin 9    Motor 3 ENA -> pin 10
  *   Leave ENA terminals disconnected unless you need software enable/disable.
  *   Enable polarity varies between driver revisions — consult your exact
  *   DM556T manual before wiring ENA to avoid accidentally disabling the driver.
  *
  * Power:
- *   Main PSU (24 V or 36 V) -> DM556T V+ / GND terminals
- *   5 V buck converter output -> Arduino 5V pin and LCD VCC
+ *   Main PSU (24 V or 36 V) -> DM556T V+ / GND terminals and HR4988 VMOT / GND
+ *   5 V buck converter output -> Arduino 5V pin, LCD VCC, and HR4988 VDD
  *     CAUTION: Verify the buck output is exactly 5.0 V with a multimeter
  *     before connecting to the Arduino 5V pin. Do NOT feed a 5 V supply
  *     into the Arduino VIN pin — VIN expects roughly 7–9 V and routes
@@ -102,10 +119,14 @@
 // 1.8° motors = 200 (most common), 0.9° motors = 400.
 #define MOTOR_FULL_STEPS_PER_REV 200
 
-// Microstepping divisor — MUST match the DM556T DIP switch setting (SW5–SW8).
+// [CHANGED] Per-motor microstepping divisors.
+// Each constant MUST match that driver's actual microstep wiring or DIP-switch setting.
+// Motor 1 is the HR4988 — MICROSTEPS_M1 must match the MS1/MS2/MS3 pin wiring in hardware.
+// Motors 2 and 3 are DM556T drivers — MICROSTEPS_M2/M3 must match the SW5–SW8 DIP switch setting.
 // Common values: 1 (full step), 2, 4, 8, 16, 32.
-// See calibration notes at the bottom of this file.
-#define MICROSTEPS               8
+#define MICROSTEPS_M1            8  // HR4988 — must match MS1/MS2/MS3 hardware wiring
+#define MICROSTEPS_M2            8  // DM556T — must match SW5–SW8 DIP switch setting
+#define MICROSTEPS_M3            8  // DM556T — must match SW5–SW8 DIP switch setting
 
 // Per-motor base speed range. Each motor's knob maps full-left to BASE_MIN_RPM
 // and full-right to BASE_MAX_RPM, independently of the master knob.
@@ -166,6 +187,14 @@ constexpr bool REVERSE[3] = { false, false, false };
 // Set back to 0 after calibrating.
 #define DEBUG_RAW_POTS 0
 
+// Set to 1 to skip normal motor control and instead pulse all three STEP pins
+// once per second. The pulse is 10 µs wide — long enough for the DM556T and
+// HR4988 but slow enough to detect with a multimeter in DC mode (the reading
+// will flick briefly on each pulse) or confirm with a logic analyser/oscilloscope.
+// Serial Monitor at 115200 prints a confirmation line on every pulse.
+// Set back to 0 and re-upload to return to normal operation.
+#define DEBUG_STEP_PINS 0
+
 // ============================================================
 // POT CALIBRATION — measured ADC endpoints per potentiometer
 // ============================================================
@@ -215,9 +244,8 @@ constexpr bool REVERSE[3] = { false, false, false };
 #define STEP_PIN_3   6
 #define DIR_PIN_3    7
 
-#define ENA_PIN_1    8   // Enable pins — defined for future use, not driven
-#define ENA_PIN_2    9
-#define ENA_PIN_3   10
+#define ENA_PIN_2    9   // Enable pins — defined for future use, not driven
+#define ENA_PIN_3   10   // (Motor 1 EN is permanently enabled in hardware)
 
 #define POT_MASTER   A0  // master multiplier knob
 #define POT_BASE_1   A1  // motor 1 base RPM knob
@@ -257,6 +285,8 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, 20, 4);
 
 // AccelStepper::DRIVER mode: separate STEP and DIR pins.
 // setSpeed() + runSpeed() → constant velocity, no acceleration ramp.
+// All three drivers (HR4988 for Motor 1, DM556T for Motors 2 and 3) use the
+// same STEP/DIR interface — AccelStepper::DRIVER is compatible with all.
 AccelStepper motors[3] = {
     AccelStepper(AccelStepper::DRIVER, STEP_PIN_1, DIR_PIN_1),
     AccelStepper(AccelStepper::DRIVER, STEP_PIN_2, DIR_PIN_2),
@@ -317,12 +347,19 @@ static int readMultiSample(uint8_t pin) {
     return avg < 0 ? 0 : (avg > 1023 ? 1023 : avg);
 }
 
-// Compile-time scale factor: steps per second per RPM.
-static constexpr float STEPS_PER_RPM =
-    static_cast<float>(MOTOR_FULL_STEPS_PER_REV) * MICROSTEPS / 60.0f;
+// [CHANGED] Per-motor compile-time scale factors: steps per second per RPM.
+// Index 0 = Motor 1 (HR4988, uses MICROSTEPS_M1).
+// Index 1 = Motor 2 (DM556T, uses MICROSTEPS_M2).
+// Index 2 = Motor 3 (DM556T, uses MICROSTEPS_M3).
+static constexpr float STEPS_PER_RPM[3] = {
+    (float)MOTOR_FULL_STEPS_PER_REV * MICROSTEPS_M1 / 60.0f,
+    (float)MOTOR_FULL_STEPS_PER_REV * MICROSTEPS_M2 / 60.0f,
+    (float)MOTOR_FULL_STEPS_PER_REV * MICROSTEPS_M3 / 60.0f
+};
 
-static float rpmToStepsPerSec(float rpm) {
-    return rpm * STEPS_PER_RPM;
+// [CHANGED] Accept motor index so each motor uses its own STEPS_PER_RPM entry.
+static float rpmToStepsPerSec(uint8_t motorIndex, float rpm) {
+    return rpm * STEPS_PER_RPM[motorIndex];
 }
 
 // ── LCD row formatting ──────────────────────────────────────────────────────
@@ -424,7 +461,8 @@ static void readAndUpdateSpeeds() {
         // at least SPEED_UPDATE_THRESHOLD RPM from what was last sent.
         if (fabsf(finalRpms[i] - lastSetRpms[i]) >= SPEED_UPDATE_THRESHOLD) {
             lastSetRpms[i] = finalRpms[i];
-            float speed    = rpmToStepsPerSec(finalRpms[i])
+            // [CHANGED] Pass motor index so the correct per-motor STEPS_PER_RPM is used.
+            float speed    = rpmToStepsPerSec(i, finalRpms[i])
                              * (REVERSE[i] ? -1.0f : 1.0f);
             motors[i].setSpeed(speed);
         }
@@ -483,7 +521,7 @@ static void updateLcdRow() {
 // ============================================================
 
 void setup() {
-#if DEBUG || DEBUG_RAW_POTS
+#if DEBUG || DEBUG_RAW_POTS || DEBUG_STEP_PINS
     Serial.begin(115200);
     Serial.println(F("Motor Control — starting"));
 #endif
@@ -501,10 +539,11 @@ void setup() {
     lcd.setCursor(0, 1);
     lcd.print(F("   Initializing...  "));
 
-    // setMaxSpeed() must be called before setSpeed().
-    // 10 % headroom ensures AccelStepper never silently clips a requested speed.
-    const float maxSpd = rpmToStepsPerSec(FINAL_MAX_RPM) * 1.1f;
+    // [CHANGED] Calculate maximum step rate independently for each motor so
+    // that different MICROSTEPS values per driver are handled correctly.
+    // 10% headroom ensures AccelStepper never silently clips a requested speed.
     for (uint8_t i = 0; i < 3; i++) {
+        float maxSpd = FINAL_MAX_RPM * STEPS_PER_RPM[i] * 1.1f;
         motors[i].setMaxSpeed(maxSpd);
         motors[i].setSpeed(0.0f);
     }
@@ -546,11 +585,48 @@ void loop() {
         digitalWrite(STEP_PIN_1, HIGH);
         digitalWrite(STEP_PIN_2, HIGH);
         digitalWrite(STEP_PIN_3, HIGH);
-        delayMicroseconds(10);          // 10 µs — above DM556T 2.5 µs minimum
+        delayMicroseconds(10);          // 10 µs — above DM556T 2.5 µs and HR4988 minimums
         digitalWrite(STEP_PIN_1, LOW);
         digitalWrite(STEP_PIN_2, LOW);
         digitalWrite(STEP_PIN_3, LOW);
         Serial.println(F("[TEST] pulsed STEP: M1=pin2  M2=pin4  M3=pin6"));
+    }
+    return;
+#endif
+
+#if DEBUG_STEP_PINS
+    // ── STEP PIN DIAGNOSTIC MODE ─────────────────────────────
+    // Pulses all three STEP pins once per second so each pin can be verified
+    // individually with a multimeter in DC mode — the reading will flick on
+    // each pulse. Probe pin 2 (M1), pin 4 (M2), pin 6 (M3) one at a time.
+    // Serial Monitor at 115200 prints a line on every pulse cycle.
+    // Normal motor control and LCD updates are suspended while active.
+    // Cycles through M1→M2→M3, holding each STEP pin HIGH for 1 s then LOW
+    // for 1 s before moving to the next motor. Only one pin is HIGH at a time.
+    // 6 states total: motor0-HIGH, motor0-LOW, motor1-HIGH, motor1-LOW, ...
+    static unsigned long lastStepPinsPulse = 0;
+    static uint8_t       stepPinState      = 0;  // 0–5
+
+    if (now - lastStepPinsPulse >= 1000UL) {
+        lastStepPinsPulse = now;
+
+        const uint8_t pins[3]    = { STEP_PIN_1, STEP_PIN_2, STEP_PIN_3 };
+        const uint8_t pinNums[3] = { 2, 4, 6 };
+
+        uint8_t motor  = stepPinState / 2;        // 0, 0, 1, 1, 2, 2
+        bool    isHigh = (stepPinState % 2) == 0; // HIGH on even states
+
+        // Drive all pins LOW first so only the active motor is ever HIGH.
+        digitalWrite(STEP_PIN_1, LOW);
+        digitalWrite(STEP_PIN_2, LOW);
+        digitalWrite(STEP_PIN_3, LOW);
+        if (isHigh) digitalWrite(pins[motor], HIGH);
+
+        Serial.print(F("[STEP] M")); Serial.print(motor + 1);
+        Serial.print(F(" pin"));    Serial.print(pinNums[motor]);
+        Serial.println(isHigh ? F(" -> HIGH") : F(" -> LOW"));
+
+        stepPinState = (stepPinState + 1) % 6;
     }
     return;
 #endif
@@ -610,8 +686,17 @@ void loop() {
 //       Common values are 0x27 and 0x3F.
 //    c) Change LCD_I2C_ADDRESS at the top of this file to match.
 //
-// ── 2. SET DM556T MICROSTEP DIP SWITCHES ────────────────────
-//    The MICROSTEPS constant in this firmware MUST match your DM556T
+// ── 2. SET MICROSTEP LEVELS ─────────────────────────────────
+//    Motor 1 (HR4988): MICROSTEPS_M1 must match the MS1/MS2/MS3 pin
+//    wiring set in hardware. The HR4988 truth table:
+//      MS1 MS2 MS3 → microsteps
+//       L   L   L  → full step  (1)
+//       H   L   L  → half step  (2)
+//       L   H   L  → quarter    (4)
+//       H   H   L  → eighth     (8)   ← firmware default
+//       H   H   H  → sixteenth  (16)
+//
+//    Motors 2 and 3 (DM556T): MICROSTEPS_M2/M3 must match the SW5–SW8
 //    DIP switch setting. A mismatch causes wrong RPM or stalling.
 //
 //    The table below is an example only. Actual switch assignments vary
@@ -626,9 +711,15 @@ void loop() {
 //      OFF OFF ON  OFF → 16
 //      ON  OFF ON  OFF → 32
 //
-// ── 3. SET DRIVER PEAK CURRENT (SW1–SW3) ───────────────────
-//    Set driver current to approximately 70–80 % of your motor's rated
-//    peak current to balance torque against heat.
+// ── 3. SET DRIVER PEAK CURRENT ──────────────────────────────
+//    Motor 1 (HR4988): Set the onboard current-limiting trimpot to
+//    approximately 70–80% of the motor's rated peak current.
+//    Formula: Vref = (rated peak current × 0.7) × 8 × Rsense
+//    Use a multimeter to measure Vref at the trimpot wiper vs. GND.
+//
+//    Motors 2 and 3 (DM556T): Set driver current (SW1–SW3) to
+//    approximately 70–80% of the motor's rated peak current to balance
+//    torque against heat.
 //    Example: 3.0 A motor → set driver to ~2.4 A.
 //    Running too high causes overheating; too low causes stalling.
 //
@@ -663,7 +754,7 @@ void loop() {
 //       Confirm serial output matches the LCD. Set DEBUG back to 0.
 //
 //    Step 2 — Connect and test one motor and driver only:
-//    h) Wire and power only Motor 1 and its DM556T driver. Leave Motors
+//    h) Wire and power only Motor 1 and its HR4988 driver. Leave Motors
 //       2 and 3 unpowered and disconnected.
 //    i) Set master to centre (100%). Slowly raise Motor 1 base RPM knob
 //       and confirm the motor spins with increasing speed.
@@ -672,8 +763,8 @@ void loop() {
 //    k) Verify direction and smooth speed change before continuing.
 //
 //    Step 3 — Add remaining motors one at a time:
-//    l) Connect and test Motor 2 alone, repeating steps i–k.
-//    m) Connect and test Motor 3 alone, repeating steps i–k.
+//    l) Connect and test Motor 2 (DM556T) alone, repeating steps i–k.
+//    m) Connect and test Motor 3 (DM556T) alone, repeating steps i–k.
 //    n) Test all three together at various master and base RPM settings.
 //
 // ── 6. CORRECT MOTOR DIRECTION ──────────────────────────────
@@ -689,11 +780,11 @@ void loop() {
 //    — After any change, verify max steps/sec stays within AccelStepper's
 //      practical limit on a 16 MHz Mega (~50 000 steps/sec):
 //
-//        max steps/sec = FINAL_MAX_RPM × MOTOR_FULL_STEPS_PER_REV × MICROSTEPS / 60
+//        max steps/sec = FINAL_MAX_RPM × MOTOR_FULL_STEPS_PER_REV × MICROSTEPS_Mn / 60
 //        Default: 400 × 200 × 8 / 60 = 10 667 steps/sec  ← well within limit.
 //
-//      If your calculation exceeds ~40 000 steps/sec, reduce MICROSTEPS
-//      or lower FINAL_MAX_RPM accordingly.
+//      If your calculation exceeds ~40 000 steps/sec, reduce the relevant
+//      MICROSTEPS_Mn constant or lower FINAL_MAX_RPM accordingly.
 //
 // ── 8. TUNING STABILITY vs. RESPONSE ────────────────────────
 //    The firmware has three knobs for trading responsiveness against stability.
