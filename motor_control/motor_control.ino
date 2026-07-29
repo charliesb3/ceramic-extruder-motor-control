@@ -124,10 +124,8 @@
  *   H11L1 ground       -> Arduino GND
  *
  *   Current implementation:
- *     Diagnostic input only.
- *
- *   Future implementation:
- *     Interrupt-driven RUN/PAUSE control.
+ *     Interrupt-driven extrusion activity detection.
+ *     extrusionActive gates all three motor outputs.
  *
  * ============================================================
  */
@@ -228,12 +226,17 @@ constexpr bool REVERSE[3] = { false, false, false };
 // Set back to 0 and re-upload to return to normal operation.
 #define DEBUG_STEP_PINS 0
 
+// Time without a detected extrusion pulse before motors are paused (ms).
+// Acceptable range: 250–500 ms. Worst-case latency equals one 250 ms check
+// interval beyond this threshold.
+#define EXTRUSION_TIMEOUT_MS  300UL
+
 // Set to 1 to enable Serial diagnostic output for the UEI extrusion sensor.
-// Prints the initial pin state once at startup, then a rate-limited summary
-// approximately every 250 ms: "UEI STATE: HIGH | TRANSITIONS: N".
-// Individual edges at high speed are counted but not printed individually —
-// the transition counter is the authoritative diagnostic for rapid activity.
-// Serial Monitor at 115200 baud. Set back to 0 after verification.
+// Reports approximately four lines per second:
+//   UEI: ACTIVE | TRANSITIONS: N    (extrusion pulse stream detected)
+//   UEI: IDLE   | TRANSITIONS: 0    (no activity; motors paused)
+// Individual edges are counted, not printed one per line.
+// Serial Monitor at 115200 baud.
 #define DEBUG_EXTRUSION_SENSOR 1
 
 // ============================================================
@@ -311,9 +314,7 @@ const int POT_ADC_MAX[4] = { MASTER_ADC_MAX, M1_ADC_MAX, M2_ADC_MAX, M3_ADC_MAX 
 #include <Wire.h>
 #include <AccelStepper.h>
 #include <LiquidCrystal_I2C.h>
-#if DEBUG_EXTRUSION_SENSOR
 #include <util/atomic.h>   // ATOMIC_BLOCK / ATOMIC_RESTORESTATE for 4-byte ISR-shared variable
-#endif
 
 // ============================================================
 // ANALOG SMOOTHER — multi-sample average → dead-zone → physical units
@@ -361,6 +362,9 @@ static int32_t  potSum  = 0;   // running sum for current pot
 static volatile bool     extrusionNewData        = false; // set by ISR, cleared in loop()
 static volatile uint8_t  extrusionPinState       = 0;     // pin state latched by ISR
 static volatile uint32_t extrusionTransitionCount = 0;    // edge count; zeroed after each report
+
+static bool          extrusionActive    = false; // true while extrusion pulse stream is detected
+static unsigned long lastTransitionTime = 0;     // millis() of last check interval with transitions
 
 // ── LCD state machine ─────────────────────────────────────────────────────
 // lcdCache[row] holds the 20-character string last written to that display row.
@@ -593,13 +597,12 @@ void setup() {
         motors[i].setSpeed(0.0f);
     }
 
-#if DEBUG_EXTRUSION_SENSOR
-    // INPUT (no pull-up): H11L1 provides a driven logic output.
-    // If the idle state is unstable or transitions occur randomly, the input
-    // may be floating — investigate whether an external pull-up is required.
-    pinMode(EXTRUSION_SENSOR_PIN, INPUT);
+    // INPUT_PULLUP: internal pull-up holds D18 HIGH at idle.
+    // The H11L1 pulls the line LOW during extrusion pulses.
+    pinMode(EXTRUSION_SENSOR_PIN, INPUT_PULLUP);
     extrusionPinState = (uint8_t)digitalRead(EXTRUSION_SENSOR_PIN);
     attachInterrupt(digitalPinToInterrupt(EXTRUSION_SENSOR_PIN), extrusionISR, CHANGE);
+#if DEBUG_EXTRUSION_SENSOR
     Serial.print(F("EXTRUSION SENSOR: "));
     Serial.println(digitalRead(EXTRUSION_SENSOR_PIN) ? F("HIGH") : F("LOW"));
 #endif
@@ -611,8 +614,8 @@ void setup() {
 // ============================================================
 // LOOP — cooperative state-machine scheduler
 //
-// Every iteration, unconditionally:
-//   runSpeed() × 3        (~4 µs total — always first, never skipped)
+// Every iteration when extrusionActive is true:
+//   runSpeed() × 3        (~4 µs total — first, gated on extrusionActive)
 //
 // Every iteration, one pot sample:
 //   doOnePotSample()      (~208 µs — one dummy + one real analogRead)
@@ -692,10 +695,12 @@ void loop() {
     return;
 #endif
 
-    // ── TOP PRIORITY: step all motors (unconditional) ────────
-    motors[0].runSpeed();
-    motors[1].runSpeed();
-    motors[2].runSpeed();
+    // ── TOP PRIORITY: step all motors (gated on extrusion activity) ──────
+    if (extrusionActive) {
+        motors[0].runSpeed();
+        motors[1].runSpeed();
+        motors[2].runSpeed();
+    }
 
     // ── ONE pot sample per iteration ─────────────────────────
     doOnePotSample();
@@ -710,31 +715,35 @@ void loop() {
         tryStartLcdRow();
     }
 
-#if DEBUG_EXTRUSION_SENSOR
+    // ── UEI extrusion state machine ───────────────────────────────────────
     {
-        static unsigned long lastUeiReport = 0;
-        if (now - lastUeiReport >= 250UL) {
-            lastUeiReport = now;
+        static unsigned long lastUeiCheck = 0;
+        if (now - lastUeiCheck >= 250UL) {
+            lastUeiCheck = now;
 
-            uint8_t  pinState;
             uint32_t transitions;
-            bool     newData;
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-                newData                  = extrusionNewData;
                 extrusionNewData         = false;
-                pinState                 = extrusionPinState;
                 transitions              = extrusionTransitionCount;
                 extrusionTransitionCount = 0;
             }
-            (void)newData;
 
-            Serial.print(F("UEI STATE: "));
-            Serial.print(pinState ? F("HIGH") : F("LOW"));
+            if (transitions > 0) {
+                lastTransitionTime = now;
+                extrusionActive    = true;
+            } else if (extrusionActive &&
+                       (now - lastTransitionTime >= EXTRUSION_TIMEOUT_MS)) {
+                extrusionActive = false;
+            }
+
+#if DEBUG_EXTRUSION_SENSOR
+            Serial.print(F("UEI: "));
+            Serial.print(extrusionActive ? F("ACTIVE") : F("IDLE"));
             Serial.print(F(" | TRANSITIONS: "));
             Serial.println(transitions);
+#endif
         }
     }
-#endif
 }
 
 // ============================================================
