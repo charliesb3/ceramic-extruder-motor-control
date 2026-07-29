@@ -726,6 +726,7 @@ void loop() {
                 transitions              = extrusionTransitionCount;
                 extrusionTransitionCount = 0;
             }
+            (void)newData;
 
             Serial.print(F("UEI STATE: "));
             Serial.print(pinState ? F("HIGH") : F("LOW"));
