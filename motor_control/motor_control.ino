@@ -598,6 +598,7 @@ void setup() {
     // If the idle state is unstable or transitions occur randomly, the input
     // may be floating — investigate whether an external pull-up is required.
     pinMode(EXTRUSION_SENSOR_PIN, INPUT);
+    extrusionPinState = (uint8_t)digitalRead(EXTRUSION_SENSOR_PIN);
     attachInterrupt(digitalPinToInterrupt(EXTRUSION_SENSOR_PIN), extrusionISR, CHANGE);
     Serial.print(F("EXTRUSION SENSOR: "));
     Serial.println(digitalRead(EXTRUSION_SENSOR_PIN) ? F("HIGH") : F("LOW"));
@@ -717,7 +718,9 @@ void loop() {
 
             uint8_t  pinState;
             uint32_t transitions;
+            bool     newData;
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                newData                  = extrusionNewData;
                 extrusionNewData         = false;
                 pinState                 = extrusionPinState;
                 transitions              = extrusionTransitionCount;
