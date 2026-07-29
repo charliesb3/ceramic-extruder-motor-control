@@ -384,7 +384,7 @@ static uint8_t  potSmpl = 0;   // samples collected so far for this pot (0–15)
 static int32_t  potSum  = 0;   // running sum for current pot
 
 // ── UEI extrusion sensor (D18 / INT5) ─────────────────────────────────────
-static volatile uint32_t extrusionTransitionCount = 0;    // edge count; zeroed after each report
+static volatile uint32_t extrusionTransitionCount = 0;    // edge count; copied and cleared every 50 ms
 
 static bool          extrusionActive    = false; // true while extrusion pulse stream is detected
 static unsigned long lastTransitionTime = 0;     // millis() of last check interval with transitions
@@ -891,15 +891,16 @@ void loop() {
 //    — Change BASE_MAX_RPM to raise or lower the per-motor ceiling.
 //    — Change MASTER_MAX_MULTIPLIER to change the master's boost range.
 //    — Update FINAL_MAX_RPM = BASE_MAX_RPM × MASTER_MAX_MULTIPLIER.
-//    — After any change, verify max steps/sec stays within AccelStepper's
-//      practical limit on a 16 MHz Mega (~50 000 steps/sec):
+//    — After any change, calculate the requested maximum step rate:
 //
-//        max steps/sec = FINAL_MAX_RPM × MOTOR_FULL_STEPS_PER_REV × MICROSTEPS_Mn / 60
-//        Default M1: 400 × 200 × 1 / 60 =  1 333 steps/sec  ← full-step HR4988
-//        Default M2/M3: 400 × 200 × 8 / 60 = 10 667 steps/sec  ← 1/8 DM556T
+//        requested steps/sec =
+//            FINAL_MAX_RPM × MOTOR_FULL_STEPS_PER_REV × MICROSTEPS_Mn / 60
+//        Default M1:     400 × 200 × 1 / 60 =  1 333 steps/sec
+//        Default M2/M3:  400 × 200 × 8 / 60 = 10 667 steps/sec
 //
-//      If your calculation exceeds ~40 000 steps/sec, reduce the relevant
-//      MICROSTEPS_Mn constant or lower FINAL_MAX_RPM accordingly.
+//      This is the requested rate, not necessarily the rate the cooperative
+//      runSpeed() scheduler can physically produce. See note 9 below for
+//      the practical scheduler limitation.
 //
 // ── 8. TUNING STABILITY vs. RESPONSE ────────────────────────
 //    In the cooperative scheduler, pots are sampled continuously and speeds
