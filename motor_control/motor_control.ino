@@ -229,7 +229,10 @@ constexpr bool REVERSE[3] = { false, false, false };
 #define DEBUG_STEP_PINS 0
 
 // Set to 1 to enable Serial diagnostic output for the UEI extrusion sensor.
-// Prints the initial pin state once at startup, then only on each transition.
+// Prints the initial pin state once at startup, then a rate-limited summary
+// approximately every 250 ms: "UEI STATE: HIGH | TRANSITIONS: N".
+// Individual edges at high speed are counted but not printed individually —
+// the transition counter is the authoritative diagnostic for rapid activity.
 // Serial Monitor at 115200 baud. Set back to 0 after verification.
 #define DEBUG_EXTRUSION_SENSOR 1
 
@@ -308,6 +311,9 @@ const int POT_ADC_MAX[4] = { MASTER_ADC_MAX, M1_ADC_MAX, M2_ADC_MAX, M3_ADC_MAX 
 #include <Wire.h>
 #include <AccelStepper.h>
 #include <LiquidCrystal_I2C.h>
+#if DEBUG_EXTRUSION_SENSOR
+#include <util/atomic.h>   // ATOMIC_BLOCK / ATOMIC_RESTORESTATE for 4-byte ISR-shared variable
+#endif
 
 // ============================================================
 // ANALOG SMOOTHER — multi-sample average → dead-zone → physical units
@@ -352,8 +358,9 @@ static uint8_t  potSmpl = 0;   // samples collected so far for this pot (0–15)
 static int32_t  potSum  = 0;   // running sum for current pot
 
 // ── UEI extrusion sensor (D18 / INT5) ─────────────────────────────────────
-static volatile bool    extrusionNewData  = false; // set by ISR, cleared in loop()
-static volatile uint8_t extrusionPinState = 0;     // pin state latched by ISR
+static volatile bool     extrusionNewData        = false; // set by ISR, cleared in loop()
+static volatile uint8_t  extrusionPinState       = 0;     // pin state latched by ISR
+static volatile uint32_t extrusionTransitionCount = 0;    // edge count; zeroed after each report
 
 // ── LCD state machine ─────────────────────────────────────────────────────
 // lcdCache[row] holds the 20-character string last written to that display row.
@@ -546,10 +553,12 @@ static void tryStartLcdRow() {
 // UEI EXTRUSION SENSOR ISR
 // ============================================================
 // Fires on every CHANGE transition of D18 (INT5).
-// Latches pin state and signals loop() — nothing else.
+// Latches pin state, increments the interval counter, signals loop().
+// No Serial, LCD, motor, float, timing, or other work allowed here.
 static void extrusionISR() {
-    extrusionPinState = (uint8_t)digitalRead(EXTRUSION_SENSOR_PIN);
-    extrusionNewData  = true;
+    extrusionPinState        = (uint8_t)digitalRead(EXTRUSION_SENSOR_PIN);
+    extrusionTransitionCount++;
+    extrusionNewData         = true;
 }
 
 // ============================================================
@@ -585,6 +594,9 @@ void setup() {
     }
 
 #if DEBUG_EXTRUSION_SENSOR
+    // INPUT (no pull-up): H11L1 provides a driven logic output.
+    // If the idle state is unstable or transitions occur randomly, the input
+    // may be floating — investigate whether an external pull-up is required.
     pinMode(EXTRUSION_SENSOR_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(EXTRUSION_SENSOR_PIN), extrusionISR, CHANGE);
     Serial.print(F("EXTRUSION SENSOR: "));
@@ -698,11 +710,25 @@ void loop() {
     }
 
 #if DEBUG_EXTRUSION_SENSOR
-    if (extrusionNewData) {
-        extrusionNewData = false;
-        Serial.println(extrusionPinState
-                       ? F("EXTRUSION SENSOR: HIGH")
-                       : F("EXTRUSION SENSOR: LOW"));
+    {
+        static unsigned long lastUeiReport = 0;
+        if (now - lastUeiReport >= 250UL) {
+            lastUeiReport = now;
+
+            uint8_t  pinState;
+            uint32_t transitions;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                extrusionNewData         = false;
+                pinState                 = extrusionPinState;
+                transitions              = extrusionTransitionCount;
+                extrusionTransitionCount = 0;
+            }
+
+            Serial.print(F("UEI STATE: "));
+            Serial.print(pinState ? F("HIGH") : F("LOW"));
+            Serial.print(F(" | TRANSITIONS: "));
+            Serial.println(transitions);
+        }
     }
 #endif
 }
@@ -860,15 +886,26 @@ void loop() {
 //    display response (at the cost of slightly more LCD overhead in the loop).
 //
 // ── UEI EXTRUSION SENSOR VERIFICATION ───────────────────────
+//    The diagnostic prints approximately four lines per second:
+//      UEI STATE: HIGH | TRANSITIONS: N
+//    Individual edges are not printed one per line. All detected edges
+//    are counted. The H11L1 produces a pulse stream during extrusion —
+//    the steady HIGH or LOW state alone does not identify activity;
+//    the transition count is the authoritative diagnostic.
+//
 //    1.  Upload the sketch with DEBUG_EXTRUSION_SENSOR 1.
 //    2.  Open Serial Monitor at 115200 baud.
 //    3.  Verify the startup state printed (HIGH or LOW at rest).
-//    4.  Trigger extrusion.
-//    5.  Verify a HIGH / LOW transition is printed.
-//    6.  Trigger very slow extrusion.
-//    7.  Trigger rapid extrusion.
-//    8.  Verify transitions are still detected at all rates.
-//    9.  Record which logic level corresponds to extrusion active.
+//    4.  At idle, confirm TRANSITIONS reports 0 each ~250 ms interval.
+//    5.  Confirm no random transitions appear while the printer is idle.
+//        Random transitions indicate noise, a grounding problem, or a
+//        floating input — investigate before proceeding.
+//    6.  Trigger slow extrusion; verify TRANSITIONS shows a nonzero count.
+//    7.  Trigger rapid extrusion; verify TRANSITIONS shows a higher count.
+//    8.  Stop extrusion; verify TRANSITIONS returns to 0.
+//    9.  Record the idle logic level. Note: the steady state alone does
+//        not identify extrusion — only nonzero TRANSITIONS confirm the
+//        pulse stream is being detected correctly.
 //   Set DEBUG_EXTRUSION_SENSOR back to 0 after verification.
 //
 // ── 9. STEPPING SMOOTHNESS NOTE ─────────────────────────────
