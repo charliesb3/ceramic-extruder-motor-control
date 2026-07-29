@@ -119,6 +119,16 @@
  *     into the Arduino VIN pin — VIN expects roughly 7–9 V and routes
  *     through the onboard regulator; 5 V on VIN may not power the board.
  *
+ * Universal Extruder Interface (UEI):
+ *   H11L1 logic output -> Arduino Mega D18 (INT5)
+ *   H11L1 ground       -> Arduino GND
+ *
+ *   Current implementation:
+ *     Diagnostic input only.
+ *
+ *   Future implementation:
+ *     Interrupt-driven RUN/PAUSE control.
+ *
  * ============================================================
  */
 
@@ -218,6 +228,11 @@ constexpr bool REVERSE[3] = { false, false, false };
 // Set back to 0 and re-upload to return to normal operation.
 #define DEBUG_STEP_PINS 0
 
+// Set to 1 to enable Serial diagnostic output for the UEI extrusion sensor.
+// Prints the initial pin state once at startup, then only on each transition.
+// Serial Monitor at 115200 baud. Set back to 0 after verification.
+#define DEBUG_EXTRUSION_SENSOR 1
+
 // ============================================================
 // POT CALIBRATION — measured ADC endpoints per potentiometer
 // ============================================================
@@ -269,6 +284,9 @@ constexpr bool REVERSE[3] = { false, false, false };
 
 #define ENA_PIN_2    9   // Enable pins — defined for future use, not driven
 #define ENA_PIN_3   10   // (Motor 1 EN is permanently enabled in hardware)
+
+// Universal Extruder Interface (UEI) — H11L1 extrusion detector
+#define EXTRUSION_SENSOR_PIN  18  // Arduino Mega D18 (INT5)
 
 #define POT_MASTER   A0  // master multiplier knob
 #define POT_BASE_1   A1  // motor 1 base RPM knob
@@ -332,6 +350,10 @@ static float lastSetRpms[3] = { -1.0f, -1.0f, -1.0f };
 static uint8_t  potIdx  = 0;   // which pot is being sampled (0–3)
 static uint8_t  potSmpl = 0;   // samples collected so far for this pot (0–15)
 static int32_t  potSum  = 0;   // running sum for current pot
+
+// ── UEI extrusion sensor (D18 / INT5) ─────────────────────────────────────
+static volatile bool    extrusionNewData  = false; // set by ISR, cleared in loop()
+static volatile uint8_t extrusionPinState = 0;     // pin state latched by ISR
 
 // ── LCD state machine ─────────────────────────────────────────────────────
 // lcdCache[row] holds the 20-character string last written to that display row.
@@ -521,11 +543,21 @@ static void tryStartLcdRow() {
 }
 
 // ============================================================
+// UEI EXTRUSION SENSOR ISR
+// ============================================================
+// Fires on every CHANGE transition of D18 (INT5).
+// Latches pin state and signals loop() — nothing else.
+static void extrusionISR() {
+    extrusionPinState = (uint8_t)digitalRead(EXTRUSION_SENSOR_PIN);
+    extrusionNewData  = true;
+}
+
+// ============================================================
 // SETUP
 // ============================================================
 
 void setup() {
-#if DEBUG || DEBUG_RAW_POTS || DEBUG_STEP_PINS
+#if DEBUG || DEBUG_RAW_POTS || DEBUG_STEP_PINS || DEBUG_EXTRUSION_SENSOR
     Serial.begin(115200);
     Serial.println(F("Motor Control — starting"));
 #endif
@@ -551,6 +583,13 @@ void setup() {
         motors[i].setMaxSpeed(maxSpd);
         motors[i].setSpeed(0.0f);
     }
+
+#if DEBUG_EXTRUSION_SENSOR
+    pinMode(EXTRUSION_SENSOR_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(EXTRUSION_SENSOR_PIN), extrusionISR, CHANGE);
+    Serial.print(F("EXTRUSION SENSOR: "));
+    Serial.println(digitalRead(EXTRUSION_SENSOR_PIN) ? F("HIGH") : F("LOW"));
+#endif
 
     delay(1500);
     lcd.clear();
@@ -657,6 +696,15 @@ void loop() {
         lastLcdCheck = now;
         tryStartLcdRow();
     }
+
+#if DEBUG_EXTRUSION_SENSOR
+    if (extrusionNewData) {
+        extrusionNewData = false;
+        Serial.println(extrusionPinState
+                       ? F("EXTRUSION SENSOR: HIGH")
+                       : F("EXTRUSION SENSOR: LOW"));
+    }
+#endif
 }
 
 // ============================================================
@@ -810,6 +858,18 @@ void loop() {
 //    for a single changing row is 250 ms; all four rows changing simultaneously
 //    take up to 1 s to fully refresh. Reduce this constant if you need faster
 //    display response (at the cost of slightly more LCD overhead in the loop).
+//
+// ── UEI EXTRUSION SENSOR VERIFICATION ───────────────────────
+//    1.  Upload the sketch with DEBUG_EXTRUSION_SENSOR 1.
+//    2.  Open Serial Monitor at 115200 baud.
+//    3.  Verify the startup state printed (HIGH or LOW at rest).
+//    4.  Trigger extrusion.
+//    5.  Verify a HIGH / LOW transition is printed.
+//    6.  Trigger very slow extrusion.
+//    7.  Trigger rapid extrusion.
+//    8.  Verify transitions are still detected at all rates.
+//    9.  Record which logic level corresponds to extrusion active.
+//   Set DEBUG_EXTRUSION_SENSOR back to 0 after verification.
 //
 // ── 9. STEPPING SMOOTHNESS NOTE ─────────────────────────────
 //    AccelStepper's runSpeed() is software-timed via micros(). The cooperative
