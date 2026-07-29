@@ -120,11 +120,18 @@
  *     through the onboard regulator; 5 V on VIN may not power the board.
  *
  * Universal Extruder Interface (UEI):
- *   H11L1 logic output -> Arduino Mega D18 (INT5)
- *   H11L1 ground       -> Arduino GND
+ *   Bridge rectifier AC output → 4.7 kΩ resistor → H11AA1 anode  (pin 1)
+ *   H11AA1 cathode (pin 2) → GND  (isolated from extruder circuitry)
+ *   H11AA1 collector (pin 5) → Arduino Mega D18 (INT5)
+ *   H11AA1 emitter  (pin 4) → Arduino GND
  *
- *   Current implementation:
- *     Interrupt-driven extrusion activity detection.
+ *   The optocoupler provides full galvanic isolation between the extruder's
+ *   stepper coil circuitry and the Arduino logic ground.
+ *   INPUT_PULLUP holds D18 HIGH at idle; the H11AA1 phototransistor pulls
+ *   D18 LOW when the bridge rectifier output exceeds the opto forward voltage.
+ *
+ *   Implementation:
+ *     Interrupt-driven extrusion activity detection (INT5, CHANGE edge).
  *     extrusionActive gates all three motor outputs.
  *
  * ============================================================
@@ -209,9 +216,6 @@
 // Set an entry to true to reverse that motor's direction.
 constexpr bool REVERSE[3] = { false, false, false };
 
-// Set to 1 to enable Serial debug output (computed speeds) at 115200 baud.
-#define DEBUG          0
-
 // Set to 1 to print raw ADC counts for all four pots once per ~250 ms.
 // Use this to find the calibration endpoints for each pot.
 // See calibration note 4 at the bottom for the procedure.
@@ -291,7 +295,7 @@ constexpr bool REVERSE[3] = { false, false, false };
 #define ENA_PIN_2    9   // Enable pins — defined for future use, not driven
 #define ENA_PIN_3   10   // (Motor 1 EN is permanently enabled in hardware)
 
-// Universal Extruder Interface (UEI) — H11L1 extrusion detector
+// Universal Extruder Interface (UEI) — H11AA1 extrusion detector
 #define EXTRUSION_SENSOR_PIN  18  // Arduino Mega D18 (INT5)
 
 #define POT_MASTER   A0  // master multiplier knob
@@ -359,8 +363,6 @@ static uint8_t  potSmpl = 0;   // samples collected so far for this pot (0–15)
 static int32_t  potSum  = 0;   // running sum for current pot
 
 // ── UEI extrusion sensor (D18 / INT5) ─────────────────────────────────────
-static volatile bool     extrusionNewData        = false; // set by ISR, cleared in loop()
-static volatile uint8_t  extrusionPinState       = 0;     // pin state latched by ISR
 static volatile uint32_t extrusionTransitionCount = 0;    // edge count; zeroed after each report
 
 static bool          extrusionActive    = false; // true while extrusion pulse stream is detected
@@ -557,12 +559,9 @@ static void tryStartLcdRow() {
 // UEI EXTRUSION SENSOR ISR
 // ============================================================
 // Fires on every CHANGE transition of D18 (INT5).
-// Latches pin state, increments the interval counter, signals loop().
-// No Serial, LCD, motor, float, timing, or other work allowed here.
+// Increments the interval counter only — no other work permitted in an ISR.
 static void extrusionISR() {
-    extrusionPinState        = (uint8_t)digitalRead(EXTRUSION_SENSOR_PIN);
     extrusionTransitionCount++;
-    extrusionNewData         = true;
 }
 
 // ============================================================
@@ -570,7 +569,7 @@ static void extrusionISR() {
 // ============================================================
 
 void setup() {
-#if DEBUG || DEBUG_RAW_POTS || DEBUG_STEP_PINS || DEBUG_EXTRUSION_SENSOR
+#if DEBUG_RAW_POTS || DEBUG_STEP_PINS || DEBUG_EXTRUSION_SENSOR
     Serial.begin(115200);
     Serial.println(F("Motor Control — starting"));
 #endif
@@ -598,9 +597,9 @@ void setup() {
     }
 
     // INPUT_PULLUP: internal pull-up holds D18 HIGH at idle.
-    // The H11L1 pulls the line LOW during extrusion pulses.
+    // The H11AA1 phototransistor pulls D18 LOW when the bridge rectifier
+    // output is active.
     pinMode(EXTRUSION_SENSOR_PIN, INPUT_PULLUP);
-    extrusionPinState = (uint8_t)digitalRead(EXTRUSION_SENSOR_PIN);
     attachInterrupt(digitalPinToInterrupt(EXTRUSION_SENSOR_PIN), extrusionISR, CHANGE);
 #if DEBUG_EXTRUSION_SENSOR
     Serial.print(F("EXTRUSION SENSOR: "));
@@ -635,28 +634,6 @@ void setup() {
 
 void loop() {
     unsigned long now = millis();
-
-#if DEBUG
-    // ── STEP PIN TEST MODE ───────────────────────────────────
-    // Sends one 10 µs pulse to every STEP pin once per second so you can
-    // probe each pin with a multimeter (DC voltage will read low but flick
-    // briefly) or an oscilloscope/logic analyser to confirm the signal.
-    // Serial Monitor at 115200 will print a confirmation line each pulse.
-    // Set DEBUG back to 0 and re-upload to return to normal operation.
-    static unsigned long lastPulse = 0;
-    if (now - lastPulse >= 1000UL) {
-        lastPulse = now;
-        digitalWrite(STEP_PIN_1, HIGH);
-        digitalWrite(STEP_PIN_2, HIGH);
-        digitalWrite(STEP_PIN_3, HIGH);
-        delayMicroseconds(10);          // 10 µs — above DM556T 2.5 µs and HR4988 minimums
-        digitalWrite(STEP_PIN_1, LOW);
-        digitalWrite(STEP_PIN_2, LOW);
-        digitalWrite(STEP_PIN_3, LOW);
-        Serial.println(F("[TEST] pulsed STEP: M1=pin2  M2=pin4  M3=pin6"));
-    }
-    return;
-#endif
 
 #if DEBUG_STEP_PINS
     // ── STEP PIN DIAGNOSTIC MODE ─────────────────────────────
@@ -723,7 +700,6 @@ void loop() {
 
             uint32_t transitions;
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-                extrusionNewData         = false;
                 transitions              = extrusionTransitionCount;
                 extrusionTransitionCount = 0;
             }
@@ -846,8 +822,6 @@ void loop() {
 //       final RPMs scale from 0 to 2× base while base RPMs stay fixed.
 //    f) Confirm all values are bounded: base RPM never exceeds 200,
 //       final RPM never exceeds 400, master never exceeds 200%.
-//    g) Set DEBUG to 1, re-upload, open Serial Monitor at 115200 baud.
-//       Confirm serial output matches the LCD. Set DEBUG back to 0.
 //
 //    Step 2 — Connect and test one motor and driver only:
 //    h) Wire and power only Motor 1 and its HR4988 driver. Leave Motors
@@ -900,10 +874,11 @@ void loop() {
 //
 // ── UEI EXTRUSION SENSOR VERIFICATION ───────────────────────
 //    The diagnostic prints approximately four lines per second:
-//      UEI STATE: HIGH | TRANSITIONS: N
+//      UEI: ACTIVE | TRANSITIONS: N
+//      UEI: IDLE   | TRANSITIONS: 0
 //    Individual edges are not printed one per line. All detected edges
-//    are counted. The H11L1 produces a pulse stream during extrusion —
-//    the steady HIGH or LOW state alone does not identify activity;
+//    are counted. The H11AA1 produces a pulse stream during extrusion —
+//    the steady logic level alone does not identify activity;
 //    the transition count is the authoritative diagnostic.
 //
 //    1.  Upload the sketch with DEBUG_EXTRUSION_SENSOR 1.
