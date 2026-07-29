@@ -5,10 +5,17 @@
  * ============================================================
  *
  * Architecture: cooperative state-machine scheduler
- *   Every loop() call unconditionally invokes runSpeed() for all three
- *   motors first. All background work (ADC reads, LCD updates) is broken
- *   into individual sub-operations that each block for at most a few
- *   hundred microseconds, so step generation is never starved.
+ *   When extrusionActive is true, runSpeed() is called for all three motors
+ *   near the start of every normal loop() iteration. When extrusionActive is
+ *   false (no extrusion pulses detected within EXTRUSION_TIMEOUT_MS),
+ *   runSpeed() is not called and no STEP pulses are generated. Pot sampling,
+ *   LCD updates, and UEI monitoring continue while the motors are paused.
+ *   Knob changes made while paused are stored in the AccelStepper objects and
+ *   take effect immediately when extrusion activity resumes.
+ *
+ *   All background work (ADC reads, LCD updates) is broken into individual
+ *   sub-operations that each block for at most a few hundred microseconds,
+ *   minimising the gap between consecutive runSpeed() calls when active.
  *
  *   Pot reads:  one double-read (dummy + real, ~208 µs) per loop iteration,
  *               cycling Master → M1 → M2 → M3 → repeat. Speeds are
@@ -120,15 +127,22 @@
  *     through the onboard regulator; 5 V on VIN may not power the board.
  *
  * Universal Extruder Interface (UEI):
- *   Bridge rectifier AC output → 4.7 kΩ resistor → H11AA1 anode  (pin 1)
- *   H11AA1 cathode (pin 2) → GND  (isolated from extruder circuitry)
- *   H11AA1 collector (pin 5) → Arduino Mega D18 (INT5)
- *   H11AA1 emitter  (pin 4) → Arduino GND
+ *   Printer side — one extruder stepper coil connects directly to the H11AA1
+ *   input through a 4.7 kΩ series resistor. No bridge rectifier is used and
+ *   no connection exists between printer ground and Arduino ground.
  *
- *   The optocoupler provides full galvanic isolation between the extruder's
- *   stepper coil circuitry and the Arduino logic ground.
- *   INPUT_PULLUP holds D18 HIGH at idle; the H11AA1 phototransistor pulls
- *   D18 LOW when the bridge rectifier output exceeds the opto forward voltage.
+ *   One coil wire  → 4.7 kΩ resistor → H11AA1 anode   (pin 1)
+ *   Other coil wire                  → H11AA1 cathode  (pin 2)
+ *
+ *   Arduino side:
+ *   H11AA1 collector (pin 5) → Arduino Mega D18 (INT5)
+ *   H11AA1 emitter   (pin 4) → Arduino GND
+ *   H11AA1 base      (pin 6) → not connected
+ *
+ *   INPUT_PULLUP holds D18 HIGH at idle. The H11AA1 phototransistor pulls
+ *   D18 LOW when the coil current is sufficient to illuminate the LED.
+ *   Extrusion activity is detected from repeated transitions, not from the
+ *   steady HIGH or LOW level.
  *
  *   Implementation:
  *     Interrupt-driven extrusion activity detection (INT5, CHANGE edge).
@@ -222,11 +236,11 @@ constexpr bool REVERSE[3] = { false, false, false };
 // Set back to 0 after calibrating.
 #define DEBUG_RAW_POTS 0
 
-// Set to 1 to skip normal motor control and instead pulse all three STEP pins
-// once per second. The pulse is 10 µs wide — long enough for the DM556T and
-// HR4988 but slow enough to detect with a multimeter in DC mode (the reading
-// will flick briefly on each pulse) or confirm with a logic analyser/oscilloscope.
-// Serial Monitor at 115200 prints a confirmation line on every pulse.
+// Set to 1 to suspend normal motor control and cycle through each STEP pin in
+// sequence for driver verification. The diagnostic holds Motor 1 STEP HIGH for
+// one second then LOW for one second, then repeats for Motor 2 and Motor 3.
+// Only one STEP pin is HIGH at a time. Serial Monitor at 115200 baud reports
+// each HIGH and LOW state change. LCD updates are also suspended while active.
 // Set back to 0 and re-upload to return to normal operation.
 #define DEBUG_STEP_PINS 0
 
@@ -437,7 +451,8 @@ static void recalcMotorSpeed(uint8_t m) {
 // the machine advances to the next pot.
 //
 // Pot cycle time: 4 pots × 16 samples × ~208 µs ≈ 13 ms end-to-end, spread
-// across individual loop() calls with runSpeed() executing between each.
+// across individual loop() calls; runSpeed() executes between each sample
+// when extrusionActive is true.
 // Worst-case blocking per call: two analogRead() ≈ ~208 µs on a 16 MHz Mega.
 static void doOnePotSample() {
     uint8_t pin = POT_PINS[potIdx];
@@ -597,8 +612,8 @@ void setup() {
     }
 
     // INPUT_PULLUP: internal pull-up holds D18 HIGH at idle.
-    // The H11AA1 phototransistor pulls D18 LOW when the bridge rectifier
-    // output is active.
+    // The H11AA1 phototransistor pulls D18 LOW when the extruder coil
+    // current through the 4.7 kΩ series resistor illuminates the LED.
     pinMode(EXTRUSION_SENSOR_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(EXTRUSION_SENSOR_PIN), extrusionISR, CHANGE);
 #if DEBUG_EXTRUSION_SENSOR
@@ -614,7 +629,11 @@ void setup() {
 // LOOP — cooperative state-machine scheduler
 //
 // Every iteration when extrusionActive is true:
-//   runSpeed() × 3        (~4 µs total — first, gated on extrusionActive)
+//   runSpeed() × 3        (~4 µs total — called first, gated on extrusionActive)
+// When extrusionActive is false:
+//   runSpeed() is not called; no STEP pulses are generated.
+//   Pot sampling, LCD updates, and UEI monitoring continue as normal.
+//   Knob changes while paused update stored speeds and apply on resume.
 //
 // Every iteration, one pot sample:
 //   doOnePotSample()      (~208 µs — one dummy + one real analogRead)
@@ -627,7 +646,7 @@ void setup() {
 //   tryStartLcdRow()      (pure computation, ~0 µs if no change; queues a
 //                          write if the next row's content has changed)
 //
-// Maximum gap between consecutive runSpeed() calls:
+// Maximum gap between consecutive runSpeed() calls (when extrusionActive):
 //   Normal (pot sample only):  ~212 µs
 //   During LCD row write:      ~454 µs  (one pot sample + one I2C op)
 // ============================================================
@@ -637,14 +656,11 @@ void loop() {
 
 #if DEBUG_STEP_PINS
     // ── STEP PIN DIAGNOSTIC MODE ─────────────────────────────
-    // Pulses all three STEP pins once per second so each pin can be verified
-    // individually with a multimeter in DC mode — the reading will flick on
-    // each pulse. Probe pin 2 (M1), pin 4 (M2), pin 6 (M3) one at a time.
-    // Serial Monitor at 115200 prints a line on every pulse cycle.
     // Normal motor control and LCD updates are suspended while active.
-    // Cycles through M1→M2→M3, holding each STEP pin HIGH for 1 s then LOW
-    // for 1 s before moving to the next motor. Only one pin is HIGH at a time.
-    // 6 states total: motor0-HIGH, motor0-LOW, motor1-HIGH, motor1-LOW, ...
+    // Cycles M1 → M2 → M3, holding each STEP pin HIGH for 1 s then LOW for
+    // 1 s before advancing to the next motor. Only one pin is HIGH at a time.
+    // Serial Monitor at 115200 baud reports each HIGH and LOW state change.
+    // 6 states total: M1-HIGH, M1-LOW, M2-HIGH, M2-LOW, M3-HIGH, M3-LOW.
     static unsigned long lastStepPinsPulse = 0;
     static uint8_t       stepPinState      = 0;  // 0–5
 
@@ -896,16 +912,27 @@ void loop() {
 //        pulse stream is being detected correctly.
 //   Set DEBUG_EXTRUSION_SENSOR back to 0 after verification.
 //
-// ── 9. STEPPING SMOOTHNESS NOTE ─────────────────────────────
-//    AccelStepper's runSpeed() is software-timed via micros(). The cooperative
-//    scheduler limits the worst-case gap between consecutive runSpeed() calls to
-//    approximately:
+// ── 9. STEPPING SMOOTHNESS AND PRACTICAL RATE LIMIT ─────────
+//    AccelStepper's runSpeed() is software-timed via micros() and generates
+//    at most one step per call. The cooperative scheduler limits the worst-case
+//    gap between consecutive runSpeed() calls to approximately:
 //      ~212 µs during pot sampling alone (no LCD write in progress)
 //      ~454 µs during an active LCD row write (pot sample + one I2C op)
 //    At Motor 1's maximum (400 RPM full-step = 1 333 steps/sec, one step every
 //    750 µs), even the worst-case 454 µs gap is well within one step period.
-//    For very high microstepped speeds (e.g. 10 667 steps/sec at 93 µs/step),
-//    hardware timer interrupts (TimerOne library or direct AVR timer registers)
-//    would eliminate jitter entirely.
+//
+//    Practical step rate limit:
+//    Because runSpeed() generates at most one step per call and the loop also
+//    performs ADC reads (~208 µs) and occasional I2C writes (~450 µs), the
+//    scheduler cannot sustain the full calculated step rate for highly
+//    microstepped motors. At 1/8 microstepping and 400 RPM, Motors 2 and 3
+//    require 10 667 steps/sec (one step every 93 µs), but the loop iteration
+//    typically takes 200–450 µs. The LCD may therefore display an RPM that the
+//    scheduler cannot physically produce at high microstepped speeds. This does
+//    not affect the UEI start/stop logic. Begin testing at moderate RPM and
+//    verify actual motor behaviour before relying on high requested speeds.
+//    Reliable operation near the highest requested rates may require lower
+//    microstepping, a lower FINAL_MAX_RPM, or timer-interrupt-based step
+//    generation (e.g. the TimerOne library or direct AVR timer registers).
 //
 // ============================================================
