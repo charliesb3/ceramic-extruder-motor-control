@@ -127,22 +127,19 @@
  *     through the onboard regulator; 5 V on VIN may not power the board.
  *
  * Universal Extruder Interface (UEI):
- *   Printer side — one extruder stepper coil connects directly to the H11AA1
- *   input through a 4.7 kΩ series resistor. No bridge rectifier is used and
- *   no connection exists between printer ground and Arduino ground.
- *
+ *   Printer side:
  *   One coil wire  → 4.7 kΩ resistor → H11AA1 anode   (pin 1)
  *   Other coil wire                  → H11AA1 cathode  (pin 2)
+ *   Printer ground is not connected to Arduino ground through the UEI.
  *
  *   Arduino side:
  *   H11AA1 collector (pin 5) → Arduino Mega D18 (INT5)
  *   H11AA1 emitter   (pin 4) → Arduino GND
  *   H11AA1 base      (pin 6) → not connected
  *
- *   INPUT_PULLUP holds D18 HIGH at idle. The H11AA1 phototransistor pulls
- *   D18 LOW when the coil current is sufficient to illuminate the LED.
- *   Extrusion activity is detected from repeated transitions, not from the
- *   steady HIGH or LOW level.
+ *   D18 uses INPUT_PULLUP. The H11AA1 output transistor pulls D18 LOW when
+ *   the optocoupler input is active. Extrusion is detected from repeated
+ *   transitions, not from the steady HIGH or LOW state.
  *
  *   Implementation:
  *     Interrupt-driven extrusion activity detection (INT5, CHANGE edge).
@@ -244,17 +241,27 @@ constexpr bool REVERSE[3] = { false, false, false };
 // Set back to 0 and re-upload to return to normal operation.
 #define DEBUG_STEP_PINS 0
 
-// Time without a detected extrusion pulse before motors are paused (ms).
-// Acceptable range: 250–500 ms. Worst-case latency equals one 250 ms check
-// interval beyond this threshold.
+// UEI activity check interval (ms). The transition counter is sampled this
+// often to keep the stop latency close to EXTRUSION_TIMEOUT_MS. With 50 ms
+// the practical stop delay after the last detected activity is ~300–350 ms.
+#define UEI_CHECK_INTERVAL_MS  50UL
+
+// UEI Serial diagnostic report interval (ms). Transitions accumulated across
+// all internal UEI_CHECK_INTERVAL_MS ticks are printed as a single total
+// once per this interval (~4 lines per second).
+#define UEI_DEBUG_INTERVAL_MS 250UL
+
+// Time after the last detected transition before motors are paused (ms).
+// With UEI_CHECK_INTERVAL_MS = 50 ms the practical stop delay is
+// approximately 300–350 ms after the final physical transition.
 #define EXTRUSION_TIMEOUT_MS  300UL
 
 // Set to 1 to enable Serial diagnostic output for the UEI extrusion sensor.
-// Reports approximately four lines per second:
+// Reports approximately four lines per second (every UEI_DEBUG_INTERVAL_MS):
 //   UEI: ACTIVE | TRANSITIONS: N    (extrusion pulse stream detected)
 //   UEI: IDLE   | TRANSITIONS: 0    (no activity; motors paused)
-// Individual edges are counted, not printed one per line.
-// Serial Monitor at 115200 baud.
+// TRANSITIONS shows the total edges accumulated across all 50 ms internal
+// checks within the reporting interval. Serial Monitor at 115200 baud.
 #define DEBUG_EXTRUSION_SENSOR 1
 
 // ============================================================
@@ -709,9 +716,20 @@ void loop() {
     }
 
     // ── UEI extrusion state machine ───────────────────────────────────────
+    // Transition counter is sampled every UEI_CHECK_INTERVAL_MS (50 ms).
+    // The timeout comparison also runs on every 50 ms tick, giving a practical
+    // stop delay of ~300–350 ms after the last physical transition.
+    // Serial diagnostics (when enabled) are printed every UEI_DEBUG_INTERVAL_MS
+    // (250 ms) and accumulate transitions across all intervening 50 ms ticks.
     {
         static unsigned long lastUeiCheck = 0;
-        if (now - lastUeiCheck >= 250UL) {
+
+#if DEBUG_EXTRUSION_SENSOR
+        static unsigned long lastUeiReport     = 0;
+        static uint32_t      reportTransitions = 0;
+#endif
+
+        if (now - lastUeiCheck >= UEI_CHECK_INTERVAL_MS) {
             lastUeiCheck = now;
 
             uint32_t transitions;
@@ -720,6 +738,10 @@ void loop() {
                 extrusionTransitionCount = 0;
             }
 
+#if DEBUG_EXTRUSION_SENSOR
+            reportTransitions += transitions;
+#endif
+
             if (transitions > 0) {
                 lastTransitionTime = now;
                 extrusionActive    = true;
@@ -727,14 +749,20 @@ void loop() {
                        (now - lastTransitionTime >= EXTRUSION_TIMEOUT_MS)) {
                 extrusionActive = false;
             }
+        }
 
 #if DEBUG_EXTRUSION_SENSOR
+        if (now - lastUeiReport >= UEI_DEBUG_INTERVAL_MS) {
+            lastUeiReport = now;
+
             Serial.print(F("UEI: "));
             Serial.print(extrusionActive ? F("ACTIVE") : F("IDLE"));
             Serial.print(F(" | TRANSITIONS: "));
-            Serial.println(transitions);
-#endif
+            Serial.println(reportTransitions);
+
+            reportTransitions = 0;
         }
+#endif
     }
 }
 
@@ -889,13 +917,17 @@ void loop() {
 //    display response (at the cost of slightly more LCD overhead in the loop).
 //
 // ── UEI EXTRUSION SENSOR VERIFICATION ───────────────────────
-//    The diagnostic prints approximately four lines per second:
+//    The transition counter is checked every 50 ms (UEI_CHECK_INTERVAL_MS).
+//    The timeout is 300 ms (EXTRUSION_TIMEOUT_MS), giving a practical stop
+//    delay of approximately 300–350 ms after the last detected activity.
+//    Serial diagnostics print approximately four lines per second
+//    (every UEI_DEBUG_INTERVAL_MS = 250 ms):
 //      UEI: ACTIVE | TRANSITIONS: N
 //      UEI: IDLE   | TRANSITIONS: 0
-//    Individual edges are not printed one per line. All detected edges
-//    are counted. The H11AA1 produces a pulse stream during extrusion —
-//    the steady logic level alone does not identify activity;
-//    the transition count is the authoritative diagnostic.
+//    TRANSITIONS shows the total edges accumulated across all 50 ms checks
+//    within each 250 ms reporting interval. The H11AA1 produces a pulse
+//    stream during extrusion — the steady logic level alone does not
+//    identify activity; the transition count is the authoritative diagnostic.
 //
 //    1.  Upload the sketch with DEBUG_EXTRUSION_SENSOR 1.
 //    2.  Open Serial Monitor at 115200 baud.
@@ -906,10 +938,9 @@ void loop() {
 //        floating input — investigate before proceeding.
 //    6.  Trigger slow extrusion; verify TRANSITIONS shows a nonzero count.
 //    7.  Trigger rapid extrusion; verify TRANSITIONS shows a higher count.
-//    8.  Stop extrusion; verify TRANSITIONS returns to 0.
-//    9.  Record the idle logic level. Note: the steady state alone does
-//        not identify extrusion — only nonzero TRANSITIONS confirm the
-//        pulse stream is being detected correctly.
+//    8.  Stop extrusion; verify TRANSITIONS returns to 0 within ~350 ms.
+//    9.  The idle logic level is HIGH at rest (INPUT_PULLUP, no coil current).
+//        Only nonzero TRANSITIONS confirm the pulse stream is active.
 //   Set DEBUG_EXTRUSION_SENSOR back to 0 after verification.
 //
 // ── 9. STEPPING SMOOTHNESS AND PRACTICAL RATE LIMIT ─────────
